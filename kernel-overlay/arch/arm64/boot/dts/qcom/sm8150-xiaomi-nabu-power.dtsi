@@ -1,0 +1,110 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * Battery and charger additions for Xiaomi Pad 5 (nabu).
+ *
+ * This file deliberately appends to the base SM8150 and nabu device trees so
+ * that sm8150.dtsi and sm8150-xiaomi-nabu.dts remain as close to upstream as
+ * possible. The base nabu DTS keeps no battery/charger nodes of its own.
+ */
+
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/iio/qcom,spmi-vadc.h>
+
+/ {
+	battery: battery {
+		compatible = "simple-battery";
+		charge-full-design-microamp-hours = <8720000>;
+		energy-full-design-microwatt-hours = <33600000>;
+		voltage-min-design-microvolt = <3400000>;
+		voltage-max-design-microvolt = <4480000>;
+	};
+};
+
+/*
+ * PM8150B SMB5 switch-mode charger. It provides the 5V USB charging path
+ * (the LN8000 is a 2:1 charge pump that only works from 9V+ fast-charge
+ * adapters). The Type-C/PD blocks stay owned by the pm8150b-typec driver.
+ */
+&spmi_bus {
+	pmic@2 {
+		pm8150b_charger: charger@1000 {
+			compatible = "qcom,pm8150b-charger";
+			reg = <0x1000>;
+
+			interrupts = <0x2 0x13 0x4 IRQ_TYPE_EDGE_BOTH>,
+				     <0x2 0x12 0x2 IRQ_TYPE_EDGE_BOTH>,
+				     <0x2 0x16 0x1 IRQ_TYPE_EDGE_RISING>,
+				     <0x2 0x13 0x7 IRQ_TYPE_EDGE_RISING>;
+			interrupt-names = "usb-plugin",
+					  "bat-ov",
+					  "wdog-bark",
+					  "usbin-icl-change";
+
+			io-channels = <&pm8150b_adc ADC5_USB_IN_I>,
+				      <&pm8150b_adc ADC5_USB_IN_V_16>;
+			io-channel-names = "usbin_i", "usbin_v";
+
+			monitored-battery = <&battery>;
+			status = "okay";
+		};
+	};
+};
+
+&pm8150b_adc {
+	channel@7 {
+		reg = <ADC5_USB_IN_I>;
+		qcom,pre-scaling = <1 1>;
+		label = "usbin_i";
+	};
+
+	channel@8 {
+		reg = <ADC5_USB_IN_V_16>;
+		qcom,pre-scaling = <1 16>;
+		label = "usbin_v";
+	};
+};
+
+&i2c4 {
+	ln8000_charger@51 {
+		compatible = "lionsemi,ln8000";
+		reg = <0x51>;
+
+		status = "okay";
+
+		irq-gpios = <&tlmm 36 0x2002>;
+
+		usb-tcpm = <&pm8150b_typec>;
+
+		ln8000_charger,bat-ovp-threshold = <4560>;
+		ln8000_charger,bat-ovp-alarm-threshold = <4525>;
+		ln8000_charger,bus-ovp-threshold = <13000>;
+		ln8000_charger,bus-ovp-alarm-threshold = <11000>;
+		ln8000_charger,bus-ocp-threshold = <3750>;
+		ln8000_charger,bus-ocp-alarm-threshold = <3500>;
+		ln8000_charger,ntc-alarm-cfg  = <226>;
+
+		ln8000_charger,tdie-prot-disable;
+		ln8000_charger,tbus-mon-disable;
+		ln8000_charger,tbat-mon-disable;
+		ln8000_charger,iin-ocp-disable;
+		ln8000_charger,iin-reg-disable;
+		ln8000_charger,tdie-reg-disable;
+		ln8000_charger,vbat-reg-disable;
+	};
+};
+
+&pm8150b_fg {
+	status = "okay";
+	monitored-battery = <&battery>;
+	power-supplies = <&pm8150b_charger>;
+};
+
+&pm8150b_typec {
+	connector {
+		sink-pdos = <PDO_FIXED(5000, 3000,
+					 PDO_FIXED_DUAL_ROLE |
+					 PDO_FIXED_USB_COMM |
+					 PDO_FIXED_DATA_SWAP)
+					 PDO_VAR(5000, 9000, 3000)>;
+	};
+};

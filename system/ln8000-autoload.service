@@ -1,0 +1,11 @@
+[Unit]
+Description=Load LionSemi LN8000 charger driver
+After=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/modprobe ln8000_charger
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
