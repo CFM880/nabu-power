@@ -263,6 +263,7 @@
 #define USBIN_SUSPEND_BIT				BIT(0)
 
 #define USBIN_ADAPTER_ALLOW_CFG				0x360
+#define USBIN_ADAPTER_ALLOW_5V_OR_9V			3
 #define USBIN_ADAPTER_ALLOW_5V_TO_12V			12
 
 #define CMD_HVDCP_2					0x343
@@ -1092,11 +1093,11 @@ static int smb2_init_hw(struct smb2_chip *chip)
 			return dev_err_probe(chip->dev, rc,
 					     "failed to enable HVDCP\n");
 
-		/* Allow the adapter to raise VBUS up to 12V (QC); the PMIC
-		 * only negotiates what the adapter supports. */
+		/* Allow the adapter to raise VBUS to 9V (QC2, stable) so the
+		 * LN8000 charge pump can also run. */
 		rc = regmap_write(chip->regmap,
 				  chip->base + USBIN_ADAPTER_ALLOW_CFG,
-				  USBIN_ADAPTER_ALLOW_5V_TO_12V);
+				  USBIN_ADAPTER_ALLOW_5V_OR_9V);
 		if (rc < 0)
 			return dev_err_probe(chip->dev, rc,
 					     "failed to set adapter allowance\n");
