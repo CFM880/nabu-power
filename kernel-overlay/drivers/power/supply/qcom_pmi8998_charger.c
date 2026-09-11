@@ -377,6 +377,19 @@ enum charger_status {
 	DISABLE_CHARGE,
 };
 
+/* PM8150B/SMB5 uses a different BATTERY_CHARGER_STATUS_1 encoding
+ * (INHIBIT first, PAUSE instead of FAST). */
+enum smb5_charger_status {
+	SMB5_INHIBIT_CHARGE = 0,
+	SMB5_TRICKLE_CHARGE,
+	SMB5_PRE_CHARGE,
+	SMB5_FULLON_CHARGE,
+	SMB5_TAPER_CHARGE,
+	SMB5_TERMINATE_CHARGE,
+	SMB5_PAUSE_CHARGE,
+	SMB5_DISABLE_CHARGE,
+};
+
 struct smb2_register {
 	u16 addr;
 	u8 mask;
@@ -423,6 +436,7 @@ struct smb2_chip {
 	unsigned int icl_status_reg;
 	unsigned int power_path_reg;
 	unsigned int bat_ov_bit;
+	int apsd_retries;
 	bool is_smb5;
 };
 
@@ -539,6 +553,26 @@ static int smb2_get_prop_status(struct smb2_chip *chip, int *val)
 
 	stat[0] = stat[0] & BATTERY_CHARGER_STATUS_MASK;
 
+	if (chip->is_smb5) {
+		switch (stat[0]) {
+		case SMB5_TRICKLE_CHARGE:
+		case SMB5_PRE_CHARGE:
+		case SMB5_FULLON_CHARGE:
+		case SMB5_TAPER_CHARGE:
+			*val = POWER_SUPPLY_STATUS_CHARGING;
+			return 0;
+		case SMB5_TERMINATE_CHARGE:
+		case SMB5_INHIBIT_CHARGE:
+			*val = POWER_SUPPLY_STATUS_FULL;
+			return 0;
+		case SMB5_DISABLE_CHARGE:
+		case SMB5_PAUSE_CHARGE:
+		default:
+			*val = POWER_SUPPLY_STATUS_NOT_CHARGING;
+			return 0;
+		}
+	}
+
 	switch (stat[0]) {
 	case TRICKLE_CHARGE:
 	case PRE_CHARGE:
@@ -597,8 +631,17 @@ static void smb2_status_change_work(struct work_struct *work)
 	chip = container_of(work, struct smb2_chip, status_change_work.work);
 
 	smb2_get_prop_usb_online(chip, &usb_online);
-	if (!usb_online)
+	if (!usb_online) {
+		/* The adapter may already be attached at boot before the power
+		 * path settles; retry a few times instead of relying on a
+		 * plug interrupt. */
+		if (chip->is_smb5 && chip->apsd_retries < 4) {
+			chip->apsd_retries++;
+			schedule_delayed_work(&chip->status_change_work,
+					      msecs_to_jiffies(1000));
+		}
 		return;
+	}
 
 	/* Release Dp/Dm from the USB PHY so the charger can run APSD/QC. */
 	if (chip->dpdm_reg) {
@@ -660,6 +703,18 @@ static void smb2_status_change_work(struct work_struct *work)
 					HVDCP_FORCE_9V_BIT, HVDCP_FORCE_9V_BIT);
 		if (rc < 0)
 			dev_warn(chip->dev, "failed to force 9V: %d\n", rc);
+	}
+
+	/* SMB5: an adapter that was already attached at boot can be
+	 * mis-classified as SDP before D+/D- settle. Retry so the QC/HVDCP
+	 * handshake is performed without requiring a re-plug. */
+	if (chip->is_smb5 && charger_type == POWER_SUPPLY_USB_TYPE_SDP &&
+	    chip->apsd_retries < 4) {
+		chip->apsd_retries++;
+		schedule_delayed_work(&chip->status_change_work,
+				      msecs_to_jiffies(2000));
+	} else {
+		chip->apsd_retries = 0;
 	}
 
 	power_supply_changed(chip->chg_psy);
@@ -794,6 +849,7 @@ static irqreturn_t smb2_handle_usb_plugin(int irq, void *data)
 {
 	struct smb2_chip *chip = data;
 
+	chip->apsd_retries = 0;
 	power_supply_changed(chip->chg_psy);
 
 	schedule_delayed_work(&chip->status_change_work,
