@@ -1139,14 +1139,21 @@ static int smb2_init_hw(struct smb2_chip *chip)
 			return dev_err_probe(chip->dev, rc,
 					     "failed to set recharge threshold\n");
 
-		/* nabu does not wire the battery thermistor to the PMIC, so the
-		 * SMB5 hardware JEITA reads a bogus too-hot state and throttles
-		 * charging. Temperature is still tracked by the fuel gauge. */
+		/* Keep hardware JEITA enabled for thermal protection. */
 		rc = regmap_update_bits(chip->regmap, chip->base + JEITA_EN_CFG,
-					GENMASK(4, 0), 0);
+					JEITA_EN_HARDLIMIT_BIT |
+					JEITA_EN_HOT_SL_FCV_BIT |
+					JEITA_EN_COLD_SL_FCV_BIT |
+					JEITA_EN_HOT_SL_CCC_BIT |
+					JEITA_EN_COLD_SL_CCC_BIT,
+					JEITA_EN_HARDLIMIT_BIT |
+					JEITA_EN_HOT_SL_FCV_BIT |
+					JEITA_EN_COLD_SL_FCV_BIT |
+					JEITA_EN_HOT_SL_CCC_BIT |
+					JEITA_EN_COLD_SL_CCC_BIT);
 		if (rc < 0)
 			return dev_err_probe(chip->dev, rc,
-					     "failed to disable JEITA\n");
+					     "failed to enable JEITA\n");
 
 		/* Conservative 1.5A default until APSD classifies the
 		 * charger; AICL will back off if the source is weaker. */
