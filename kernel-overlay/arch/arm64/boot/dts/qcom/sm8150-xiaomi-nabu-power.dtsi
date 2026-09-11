@@ -44,6 +44,9 @@
 				      <&pm8150b_adc ADC5_USB_IN_V_16>;
 			io-channel-names = "usbin_i", "usbin_v";
 
+			/* Let the USB HS PHY release D+/D- for APSD/QC. */
+			dpdm-supply = <&usb_1_hsphy>;
+
 			monitored-battery = <&battery>;
 			status = "okay";
 		};

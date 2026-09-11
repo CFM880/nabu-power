@@ -20,6 +20,7 @@
 #include <linux/of.h>
 #include <linux/power_supply.h>
 #include <linux/regmap.h>
+#include <linux/regulator/consumer.h>
 #include <linux/types.h>
 #include <linux/workqueue.h>
 
@@ -43,7 +44,6 @@
 #define BAT_TEMP_STATUS_TOO_HOT_BIT			BIT(1)
 #define BAT_TEMP_STATUS_TOO_COLD_BIT			BIT(0)
 
-#define BATTERY_CHARGER_STATUS_4			0x0A
 #define CHARGE_CURRENT_POST_JEITA_MASK			GENMASK(7, 0)
 
 #define BATTERY_CHARGER_STATUS_7			0x0D
@@ -263,7 +263,10 @@
 #define USBIN_SUSPEND_BIT				BIT(0)
 
 #define USBIN_ADAPTER_ALLOW_CFG				0x360
-#define USBIN_ADAPTER_ALLOW_5V_TO_9V			8
+#define USBIN_ADAPTER_ALLOW_5V_TO_12V			12
+
+#define CMD_HVDCP_2					0x343
+#define HVDCP_FORCE_9V_BIT				BIT(4)
 
 #define TYPE_C_INTRPT_ENB_SOFTWARE_CTRL			0x368
 #define EXIT_SNK_BASED_ON_CC_BIT			BIT(7)
@@ -407,16 +410,19 @@ struct smb2_chip {
 	struct iio_channel *usb_in_v_chan;
 
 	struct power_supply *chg_psy;
+	struct regulator *dpdm_reg;
 
 	/* Per-PMIC register scaling. SMB2 uses 25mA/7.5mV steps, SMB5 (PM8150B)
 	 * uses 50mA/10mV steps and is configured by the Type-C driver instead. */
 	unsigned int curr_scale;
 	unsigned int curr_max_ua;
+	unsigned int fcc_ua;
 	unsigned int fv_base_uv;
 	unsigned int fv_step_uv;
 	unsigned int fv_max_uv;
 	unsigned int icl_status_reg;
 	unsigned int power_path_reg;
+	unsigned int bat_ov_bit;
 	bool is_smb5;
 };
 
@@ -424,11 +430,13 @@ struct smb2_match_data {
 	const char *name;
 	unsigned int curr_scale;
 	unsigned int curr_max_ua;
+	unsigned int fcc_ua;
 	unsigned int fv_base_uv;
 	unsigned int fv_step_uv;
 	unsigned int fv_max_uv;
 	unsigned int icl_status_reg;
 	unsigned int power_path_reg;
+	unsigned int bat_ov_bit;
 	bool is_smb5;
 };
 
@@ -524,7 +532,7 @@ static int smb2_get_prop_status(struct smb2_chip *chip, int *val)
 		return rc;
 	}
 
-	if (stat[1] & CHARGER_ERROR_STATUS_BAT_OV_BIT) {
+	if (stat[1] & chip->bat_ov_bit) {
 		*val = POWER_SUPPLY_STATUS_NOT_CHARGING;
 		return 0;
 	}
@@ -592,6 +600,13 @@ static void smb2_status_change_work(struct work_struct *work)
 	if (!usb_online)
 		return;
 
+	/* Release Dp/Dm from the USB PHY so the charger can run APSD/QC. */
+	if (chip->dpdm_reg) {
+		rc = regulator_enable(chip->dpdm_reg);
+		if (rc < 0)
+			dev_warn(chip->dev, "failed to enable DPDM: %d\n", rc);
+	}
+
 	for (count = 0; count < 3; count++) {
 		dev_dbg(chip->dev, "get charger type retry %d\n", count);
 		rc = smb2_apsd_get_charger_type(chip, &charger_type);
@@ -599,6 +614,9 @@ static void smb2_status_change_work(struct work_struct *work)
 			break;
 		msleep(100);
 	}
+
+	if (chip->dpdm_reg)
+		regulator_disable(chip->dpdm_reg);
 
 	if (rc < 0 && rc != -EAGAIN) {
 		dev_err(chip->dev, "get charger type failed: %d\n", rc);
@@ -625,11 +643,25 @@ static void smb2_status_change_work(struct work_struct *work)
 		break;
 	case POWER_SUPPLY_USB_TYPE_SDP:
 	default:
-		current_ua = SDP_CURRENT_UA;
+		/* Don't throttle a misclassified wall charger down to the USB
+		 * spec 500mA on SMB5 boards. */
+		current_ua = chip->is_smb5 ? 1500000 : SDP_CURRENT_UA;
 		break;
 	}
 
 	smb2_set_current_limit(chip, current_ua);
+
+	if (chip->is_smb5 &&
+	    (charger_type == POWER_SUPPLY_USB_TYPE_DCP ||
+	     charger_type == POWER_SUPPLY_USB_TYPE_CDP)) {
+		/* Deterministically ask a QC adapter for 9V. A non-QC
+		 * adapter ignores the request and stays at 5V. */
+		rc = regmap_update_bits(chip->regmap, chip->base + CMD_HVDCP_2,
+					HVDCP_FORCE_9V_BIT, HVDCP_FORCE_9V_BIT);
+		if (rc < 0)
+			dev_warn(chip->dev, "failed to force 9V: %d\n", rc);
+	}
+
 	power_supply_changed(chip->chg_psy);
 }
 
@@ -952,7 +984,7 @@ static int smb2_init_hw(struct smb2_chip *chip)
 	rc = regmap_update_bits(chip->regmap,
 				chip->base + FAST_CHARGE_CURRENT_CFG,
 				FAST_CHARGE_CURRENT_SETTING_MASK,
-				1000000 / chip->curr_scale);
+				chip->fcc_ua / chip->curr_scale);
 	if (rc < 0)
 		return dev_err_probe(chip->dev, rc,
 				     "failed to set fast-charge current\n");
@@ -997,10 +1029,11 @@ static int smb2_init_hw(struct smb2_chip *chip)
 			return dev_err_probe(chip->dev, rc,
 					     "failed to enable HVDCP\n");
 
-		/* Only ask the adapter for up to 9V. */
+		/* Allow the adapter to raise VBUS up to 12V (QC); the PMIC
+		 * only negotiates what the adapter supports. */
 		rc = regmap_write(chip->regmap,
 				  chip->base + USBIN_ADAPTER_ALLOW_CFG,
-				  USBIN_ADAPTER_ALLOW_5V_TO_9V);
+				  USBIN_ADAPTER_ALLOW_5V_TO_12V);
 		if (rc < 0)
 			return dev_err_probe(chip->dev, rc,
 					     "failed to set adapter allowance\n");
@@ -1042,6 +1075,15 @@ static int smb2_init_hw(struct smb2_chip *chip)
 		if (rc < 0)
 			return dev_err_probe(chip->dev, rc,
 					     "failed to set recharge threshold\n");
+
+		/* nabu does not wire the battery thermistor to the PMIC, so the
+		 * SMB5 hardware JEITA reads a bogus too-hot state and throttles
+		 * charging. Temperature is still tracked by the fuel gauge. */
+		rc = regmap_update_bits(chip->regmap, chip->base + JEITA_EN_CFG,
+					GENMASK(4, 0), 0);
+		if (rc < 0)
+			return dev_err_probe(chip->dev, rc,
+					     "failed to disable JEITA\n");
 
 		/* Conservative 1.5A default until APSD classifies the
 		 * charger; AICL will back off if the source is weaker. */
@@ -1098,11 +1140,13 @@ static int smb2_probe(struct platform_device *pdev)
 	chip->name = data->name;
 	chip->curr_scale = data->curr_scale;
 	chip->curr_max_ua = data->curr_max_ua;
+	chip->fcc_ua = data->fcc_ua;
 	chip->fv_base_uv = data->fv_base_uv;
 	chip->fv_step_uv = data->fv_step_uv;
 	chip->fv_max_uv = data->fv_max_uv;
 	chip->icl_status_reg = data->icl_status_reg;
 	chip->power_path_reg = data->power_path_reg;
+	chip->bat_ov_bit = data->bat_ov_bit;
 	chip->is_smb5 = data->is_smb5;
 
 	chip->regmap = dev_get_regmap(pdev->dev.parent, NULL);
@@ -1120,6 +1164,13 @@ static int smb2_probe(struct platform_device *pdev)
 		if (PTR_ERR(chip->usb_in_v_chan) == -EPROBE_DEFER)
 			return -EPROBE_DEFER;
 		chip->usb_in_v_chan = NULL;
+	}
+
+	chip->dpdm_reg = devm_regulator_get_optional(chip->dev, "dpdm");
+	if (IS_ERR(chip->dpdm_reg)) {
+		if (PTR_ERR(chip->dpdm_reg) == -EPROBE_DEFER)
+			return -EPROBE_DEFER;
+		chip->dpdm_reg = NULL;
 	}
 
 	rc = smb2_init_hw(chip);
@@ -1197,32 +1248,38 @@ static const struct smb2_match_data smb2_pmi8998_data = {
 	.name = "pmi8998",
 	.curr_scale = 25000,
 	.curr_max_ua = 4800000,
+	.fcc_ua = 1000000,
 	.fv_base_uv = 3480000,
 	.fv_step_uv = 7500,
 	.icl_status_reg = ICL_STATUS,
 	.power_path_reg = POWER_PATH_STATUS,
+	.bat_ov_bit = 0x20,
 };
 
 static const struct smb2_match_data smb2_pm660_data = {
 	.name = "pm660",
 	.curr_scale = 25000,
 	.curr_max_ua = 4800000,
+	.fcc_ua = 1000000,
 	.fv_base_uv = 3480000,
 	.fv_step_uv = 7500,
 	.icl_status_reg = ICL_STATUS,
 	.power_path_reg = POWER_PATH_STATUS,
+	.bat_ov_bit = 0x20,
 };
 
 static const struct smb2_match_data smb2_pm8150b_data = {
 	.name = "pm8150b",
 	.curr_scale = 50000,
 	.curr_max_ua = 5000000,
+	.fcc_ua = 3000000,
 	.fv_base_uv = 3600000,
 	.fv_step_uv = 10000,
 	.fv_max_uv = 4470000,
 	/* SMB5 puts the DCDC status registers at DCDC_BASE (0x1100). */
 	.icl_status_reg = 0x107,
 	.power_path_reg = 0x10B,
+	.bat_ov_bit = 0x02,
 	.is_smb5 = true,
 };
 

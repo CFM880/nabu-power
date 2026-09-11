@@ -45,6 +45,11 @@ UPower/GNOME 可正确显示充电。
 电量掉到 99% 自动回充。终止时 `BATTERY_CHARGER_STATUS_1` 映射为
 `POWER_SUPPLY_STATUS_FULL`，UPower 显示已充满。
 
+QC 识别依赖 D+/D-（DPDM）：充电器在跑 APSD 前会把 USB HS PHY 通过
+`dpdm-supply` 切到 UTMI non-driving（高阻），把 Dp/Dm 让给 SMB5 做握手；
+否则 APSD 只会把适配器判成 SDP/OCP。上述 5V、QC 9V 和充满终止/回充均已实机
+验证。
+
 ## 目录
 
 ```text

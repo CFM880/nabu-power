@@ -58,18 +58,24 @@ compatible. SMB5 shares the CHGR/USBIN register offsets with SMB2 but differs in
 - the extra bring-up needed for charging: resume USBIN (`USBIN_CMD_IL`),
   select the USBIN charge path (`USBIN_ICL_OPTIONS.USBIN_MODE_CHG`), clear
   `CHGR_CFG2.CHARGER_INHIBIT`, and enable HVDCP autonomous mode for QC2/QC3
-  with the adapter allowance capped at 9V and an APSD re-run so an adapter
-  that was already attached at boot is re-classified.
+  with a 5-12V adapter allowance and an APSD re-run so an adapter that was
+  already attached at boot is re-classified.
 
 Driver changes maintained directly in this repository:
 
 - `qcom_pmi8998_charger.c`: per-PMIC scaling/register data and the PM8150B
-  bring-up above; HVDCP with a 5-9V adapter allowance and an APSD re-run so an
-  already-attached adapter is classified at boot; ADC-based charge termination
-  at 400mA, auto-recharge at 99%, a 4.47V float-voltage cap, per-PMIC input
-  current limits, and an optional input-voltage IIO channel that defers the
-  probe when the PM8150B VADC is not ready yet (the raw USB_IN sense voltage is
-  intentionally not exposed as `CURRENT_NOW`);
+  bring-up above; HVDCP with a 5-12V adapter allowance and an APSD re-run so an
+  already-attached adapter is classified at boot; per-PMIC fast-charge current
+  (3A on PM8150B), a per-PMIC battery-overvoltage status bit (SMB5 uses BIT(1),
+  SMB2 uses BIT(5)), ADC-based charge termination at 400mA, auto-recharge at
+  99%, a 4.47V float-voltage cap, per-PMIC input current limits, a 1.5A SDP
+  floor, disabled SMB5 hardware JEITA (nabu does not wire the PMIC thermistor),
+  and an optional input-voltage IIO channel that defers the probe when the
+  PM8150B VADC is not ready yet (the raw USB_IN sense voltage is intentionally
+  not exposed as `CURRENT_NOW`);
+- `drivers/phy/qualcomm/phy-qcom-snps-femto-v2.c`: a `dpdm` regulator that puts
+  the USB HS PHY into UTMI non-driving mode, releasing Dp/Dm for the charger's
+  APSD/QC detection (`dpdm-supply` is wired to `usb_1_hsphy` in the DTS);
 - `qcom_fg.c`: avoid reading an uninitialized `propval.intval` in the charger
   notifier, return `-EPROBE_DEFER` when a DT-described charger supply is not
   registered yet, take the battery status from the charger
