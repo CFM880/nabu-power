@@ -650,28 +650,35 @@ static void smb2_status_change_work(struct work_struct *work)
 			dev_warn(chip->dev, "failed to enable DPDM: %d\n", rc);
 	}
 
-	for (count = 0; count < 3; count++) {
+	/*
+	 * APSD is asynchronous. Kick it and poll while Dp/Dm stay released;
+	 * re-running it without DPDM never completes.
+	 */
+	for (count = 0; count < 8; count++) {
 		dev_dbg(chip->dev, "get charger type retry %d\n", count);
 		rc = smb2_apsd_get_charger_type(chip, &charger_type);
 		if (rc != -EAGAIN)
 			break;
-		msleep(100);
+		regmap_update_bits(chip->regmap, chip->base + CMD_APSD,
+				   APSD_RERUN_BIT, APSD_RERUN_BIT);
+		msleep(150);
 	}
 
 	if (chip->dpdm_reg)
 		regulator_disable(chip->dpdm_reg);
 
-	if (rc < 0 && rc != -EAGAIN) {
-		dev_err(chip->dev, "get charger type failed: %d\n", rc);
+	if (rc == -EAGAIN) {
+		dev_dbg(chip->dev, "apsd not ready, will retry\n");
+		if (chip->is_smb5 && chip->apsd_retries < 4) {
+			chip->apsd_retries++;
+			schedule_delayed_work(&chip->status_change_work,
+					      msecs_to_jiffies(2000));
+		}
 		return;
 	}
 
 	if (rc < 0) {
-		rc = regmap_update_bits(chip->regmap, chip->base + CMD_APSD,
-					APSD_RERUN_BIT, APSD_RERUN_BIT);
-		schedule_delayed_work(&chip->status_change_work,
-				      msecs_to_jiffies(1000));
-		dev_dbg(chip->dev, "get charger type failed, rerun apsd\n");
+		dev_err(chip->dev, "get charger type failed: %d\n", rc);
 		return;
 	}
 
