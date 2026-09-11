@@ -55,7 +55,7 @@ QC 识别依赖 D+/D-（DPDM）：充电器在跑 APSD 前会把 USB HS PHY 通�
 ```text
 kernel-overlay/   按 Linux 源码路径组织的电源内核源码
 config/           可合并到现有 .config 的电源 Kconfig fragment
-scripts/          覆盖与构建辅助脚本
+patches/          基线 DTS 拆分补丁
 system/           可选的 modprobe 与 systemd 配置
 LICENSES/         源码 SPDX 标识对应的许可证文本
 ```
@@ -67,89 +67,57 @@ LICENSES/         源码 SPDX 标识对应的许可证文本
   HVDCP、USBIN resume/MODE_CHG、清除 charge inhibit）；
 - `drivers/power/supply/qcom_fg.c`：状态接充电器、`CURRENT_NOW` 符号标准化；
 - `drivers/power/supply/ln8000_charger.c`：秒级状态日志降为 debug；
-- 派生 DTS 与生产组合 DTS。
+- 派生 DTS 片段与基线 DTS 拆分补丁。
 
 
-## 设备树追加模式
+## 设备树
 
-与 `nabu-iris`/`nabu-camera` 一样，电源设备树也使用派生板级文件：
+与 `nabu-iris`/`nabu-camera` 一样，电源设备树也使用追加模式，由两部分组成：
 
-```text
-sm8150-xiaomi-nabu-power.dts
-  ├─ include sm8150-xiaomi-nabu.dts
-  └─ include sm8150-xiaomi-nabu-power.dtsi
-```
+- `arch/arm64/boot/dts/qcom/sm8150-xiaomi-nabu-power.dtsi`：追加电池、LN8000
+  充电器与 `pm8150b_fg` 节点；
+- `patches/0001-base-dts-split-power.patch`：从基线 `sm8150-xiaomi-nabu.dts`
+  中移除原本内联的电池、LN8000、`pm8150b_fg` 和 Type-C `sink-pdos` 定义。
 
-另外提供生产用的组合 DTS `sm8150-xiaomi-nabu-iris-camera-accelerometer-power.dts`，
-把 Iris、相机、SLPI/SSC 加速度计和电源四个片段汇总成一个启动镜像设备树：
+组合 DTB 不再手写，由 `nabu-main compose` 按产品顺序自动生成：
 
-```text
-sm8150-xiaomi-nabu-iris-camera-accelerometer-power.dts
-  ├─ include sm8150-xiaomi-nabu.dts
-  ├─ include sm8150-xiaomi-nabu-iris.dtsi
-  ├─ include sm8150-xiaomi-nabu-camera.dtsi
-  ├─ include sm8150-xiaomi-nabu-accelerometer-slpi-boot-only.dtsi
-  └─ include sm8150-xiaomi-nabu-power.dtsi
+```dts
+#include "sm8150-xiaomi-nabu.dts"
+#include "sm8150-xiaomi-nabu-iris.dtsi"
+#include "sm8150-xiaomi-nabu-camera.dtsi"
+#include "sm8150-xiaomi-nabu-accelerometer-slpi-boot-only.dtsi"
+#include "sm8150-xiaomi-nabu-power.dtsi"
 ```
 
 它必须使用最终的 SLPI/SSC 加速度计片段，不能再用已废止的 AP 侧 LSM6DSO
 `sm8150-xiaomi-nabu-accelerometer.dtsi`（会让 `spi-geni-qcom` 访问 SLPI 拥有的
 SSC MMIO，历史上会卡死内核）。
 
-有一点与其它模块不同：电池、LN8000 充电器、`pm8150b_fg` 使能和 Type-C
-`sink-pdos` 电压限制原本直接写在基线的
-`sm8150-xiaomi-nabu.dts` 里。为让电源功能可独立拆装，本模块把这几处电源节点
-**从基线 DTS 中移出**，放进 `sm8150-xiaomi-nabu-power.dtsi`；模块覆盖层同时
-携带去除了这些节点的 `sm8150-xiaomi-nabu.dts`。因此：
+## 统一构建（nabu-main）
 
-- 应用本覆盖层后，基线 nabu DTS 不再含电池/充电节点；
-- 启动时必须使用派生 DTB `qcom/sm8150-xiaomi-nabu-power.dtb`，原始 nabu
-  DTB 不含这些节点；
-- 共享的 `pm8150b.dtsi` 保持不动，其 `pm8150b_fg` 节点（默认 `disabled`）
-  由派生 DTS 使能。
+本仓库不再自带覆盖、配置合并或模块构建脚本。`nabu-main` 读取根目录的
+`nabu-module.toml`，先 `git apply` 上述补丁，再复制 overlay：
 
-## 放入内核树
+```toml
+[provides]
+overlay = "kernel-overlay"
+patches = ["patches/0001-base-dts-split-power.patch"]
+dtsi    = ["arch/arm64/boot/dts/qcom/sm8150-xiaomi-nabu-power.dtsi"]
+config  = ["config/nabu-power.config"]
+systemd = ["system/ln8000-autoload.service"]
 
-准备位于精确基线的 Linux 源码树：
+[build]
+kernel_targets = ["drivers/power/supply/ln8000_charger.ko"]
+```
+
+在内核基线 `5181e1358ddd6ea8028e841d928942373e6aebc8` 上，于 `nabu-main` 运行：
 
 ```sh
-git clone https://gitlab.postmarketos.org/soc/qualcomm-sm8150/linux.git linux
-git -C linux checkout 5181e1358ddd6ea8028e841d928942373e6aebc8
-./scripts/apply-overlay.sh ./linux
-```
-
-安装脚本允许目标树存在不重叠的修改，所以可以先应用 `nabu-iris`、
-`nabu-camera`、`nabu-accelerometer`，最后再应用本覆盖层。生产组合 DTB
-在构建时才需要那三个片段；如果某个电源覆盖目标（包括被抽取电源节点后的
-`sm8150-xiaomi-nabu.dts`）已被其他工作修改，脚本会停止，不会静默覆盖。
-
-## 构建
-
-输出目录需要已有适用于 nabu 的 `.config`。构建脚本先用内核自带的
-`merge_config.sh` 合并 `config/nabu-power.config`，不会替换主 defconfig：
-
-```sh
-./scripts/build.sh ./linux ./linux/out
-```
-
-也可以只合并配置：
-
-```sh
-./scripts/merge-config.sh ./linux ./linux/out
-```
-
-脚本构建 `ln8000_charger.ko` 模块以及派生 DTB。如果已安装 Iris、相机和加速度计
-覆盖层，脚本自动改为构建生产组合 DTB：
-
-```text
-linux/out/drivers/power/supply/ln8000_charger.ko
-linux/out/arch/arm64/boot/dts/qcom/sm8150-xiaomi-nabu-iris-camera-accelerometer-power.dtb
-```
-
-仅安装电源覆盖层时退回到：
-
-```text
-linux/out/arch/arm64/boot/dts/qcom/sm8150-xiaomi-nabu-power.dtb
+make apply      # reset linux，应用 overlay/patch
+make compose    # 生成组合 DTS
+make config     # 合并 fragment 并固定统一 release
+make build      # 构建 Image、模块与 DTB
+make collect    # 收集产物到 artifacts/<product>/
 ```
 
 `qcom_fg` 编译进内核镜像（`CONFIG_BATTERY_QCOM_FG=y`），不产生独立模块。

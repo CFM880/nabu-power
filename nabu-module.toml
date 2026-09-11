@@ -1,0 +1,23 @@
+schema = 1
+
+[module]
+name        = "nabu-power"
+description = "Battery, fuel gauge and LN8000 charging support"
+requires    = []
+
+[provides]
+overlay  = "kernel-overlay"
+patches  = ["patches/0001-base-dts-split-power.patch"]
+dtsi     = ["arch/arm64/boot/dts/qcom/sm8150-xiaomi-nabu-power.dtsi"]
+config   = ["config/nabu-power.config"]
+systemd  = ["system/ln8000-autoload.service"]
+
+[build]
+kernel_targets = ["drivers/power/supply/ln8000_charger.ko"]
+
+[artifacts]
+"ln8000_charger.ko" = "out:drivers/power/supply/ln8000_charger.ko"
+
+[install]
+"ln8000_charger.ko"                  = "/lib/modules/@release@/kernel/drivers/power/supply/ln8000_charger.ko"
+"systemd/ln8000-autoload.service"    = "/etc/systemd/system/ln8000-autoload.service"

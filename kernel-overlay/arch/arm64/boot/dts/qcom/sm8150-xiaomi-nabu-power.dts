@@ -1,9 +1,0 @@
-// SPDX-License-Identifier: BSD-3-Clause
-/*
- * Xiaomi Pad 5 (nabu) battery/charging-enabled derivative.
- *
- * Keep the base board DTS unchanged and append the power description.
- */
-
-#include "sm8150-xiaomi-nabu.dts"
-#include "sm8150-xiaomi-nabu-power.dtsi"
