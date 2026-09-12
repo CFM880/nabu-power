@@ -1,0 +1,3 @@
+# The 6.18 branch's own sm8150-xiaomi-nabu.dts is used verbatim as the base
+# device tree; the base-DTS split is handled by
+# sm8150-xiaomi-nabu-power-6.18.dtsi instead of patching the branch tree.
