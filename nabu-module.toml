@@ -7,7 +7,6 @@ requires    = []
 
 [provides]
 overlay  = "kernel-overlay"
-patches  = ["patches/0001-base-dts-split-power.patch"]
 dtsi     = ["arch/arm64/boot/dts/qcom/sm8150-xiaomi-nabu-power.dtsi"]
 config   = ["config/nabu-power.config"]
 systemd  = ["system/ln8000-autoload.service"]
