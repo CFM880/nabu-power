@@ -2,23 +2,13 @@
 /*
  * Battery and charger additions for Xiaomi Pad 5 (nabu).
  *
- * This file deliberately appends to the base SM8150 and nabu device trees so
- * that sm8150.dtsi and sm8150-xiaomi-nabu.dts remain as close to upstream as
- * possible. The base nabu DTS keeps no battery/charger nodes of its own.
+ * This file only appends the charging path to the kernel branch's own
+ * sm8150-xiaomi-nabu.dts, which is used verbatim as the base device tree and
+ * already provides the battery node.  The base DTS is never patched.
  */
 
 #include <dt-bindings/interrupt-controller/irq.h>
 #include <dt-bindings/iio/qcom,spmi-vadc.h>
-
-/ {
-	battery: battery {
-		compatible = "simple-battery";
-		charge-full-design-microamp-hours = <8720000>;
-		energy-full-design-microwatt-hours = <33600000>;
-		voltage-min-design-microvolt = <3400000>;
-		voltage-max-design-microvolt = <4480000>;
-	};
-};
 
 /*
  * PM8150B SMB5 switch-mode charger. It provides the 5V USB charging path
