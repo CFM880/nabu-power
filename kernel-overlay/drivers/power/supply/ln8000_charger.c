@@ -1011,7 +1011,7 @@ static int ln8000_get_adc_data(struct ln8000_info *info, unsigned int ch, int *r
 static void psy_chg_get_ti_alarm_status(struct work_struct *work)
 {
     struct ln8000_info *info = container_of(work, struct ln8000_info, charge_work.work);
-    unsigned int v_offset;
+    int v_offset;
     bool bus_ovp, bus_ocp, bat_ovp;
     u8 val[4];
 
