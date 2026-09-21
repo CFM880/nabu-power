@@ -52,9 +52,11 @@ correctly.
 
 Full charge is handled by the SMB5 hardware CC/CV: it charges to 4.47V, then holds constant voltage
 until the current decays; when capacity drops to 99% it automatically recharges. The PM8150B ADC
-charge termination does not fire reliably on nabu, so `POWER_SUPPLY_STATUS_FULL` is latched in
-software once the pack is at 100% and the charge current has tapered below 400mA (mirroring the
-vendor `charge_full` flag); UPower then shows a full charge.
+charge termination does not work on nabu: with the threshold, the ADC comparator and the sample mode
+all programmed correctly (verified by register read-back) the comparator still never trips, even
+with the threshold pushed to -2000mA. `POWER_SUPPLY_STATUS_FULL` is therefore latched in software
+once the pack is at 100% and the charge current has tapered below 400mA (mirroring the vendor
+`charge_full` flag); UPower then shows a full charge.
 
 QC detection depends on D+/D- (DPDM): before running APSD, the charger switches the USB HS PHY
 through `dpdm-supply` to UTMI non-driving (high impedance), handing Dp/Dm to the SMB5 for handshake;

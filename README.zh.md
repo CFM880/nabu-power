@@ -47,9 +47,11 @@ A-to-C（USB-A 口）充电由三段组成，缺一不可：
 UPower/GNOME 可正确显示充电。
 
 充满由 SMB5 硬件 CC/CV 完成：充电到 4.47V 后恒压，电流衰减；电量掉到 99%
-自动回充。PM8150B 的 ADC 充电终止在 nabu 上不能可靠触发，因此当电量到 100%
-且充电电流衰减到 400mA 以下时，由软件锁存 `POWER_SUPPLY_STATUS_FULL`
-（对应 vendor 的 `charge_full` 标志），UPower 显示已充满。
+自动回充。PM8150B 的 ADC 充电终止在 nabu 上不工作：门限、ADC 比较器与采样
+模式都已正确配置（已用寄存器回读确认），但比较器始终不翻转，即使把门限推到
+-2000mA。因此当电量到 100% 且充电电流衰减到 400mA 以下时，由软件锁存
+`POWER_SUPPLY_STATUS_FULL`（对应 vendor 的 `charge_full` 标志），UPower
+显示已充满。
 
 QC 识别依赖 D+/D-（DPDM）：充电器在跑 APSD 前会把 USB HS PHY 通过
 `dpdm-supply` 切到 UTMI non-driving（高阻），把 Dp/Dm 让给 SMB5 做握手；
