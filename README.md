@@ -51,9 +51,10 @@ the standard convention (positive = charging), so the desktop UPower/GNOME can d
 correctly.
 
 Full charge is handled by the SMB5 hardware CC/CV: it charges to 4.47V, then holds constant voltage
-until the current decays to about 400mA and terminates; when capacity drops to 99% it automatically
-recharges. On termination, `BATTERY_CHARGER_STATUS_1` maps to `POWER_SUPPLY_STATUS_FULL`, and UPower
-shows a full charge.
+until the current decays; when capacity drops to 99% it automatically recharges. The PM8150B ADC
+charge termination does not fire reliably on nabu, so `POWER_SUPPLY_STATUS_FULL` is latched in
+software once the pack is at 100% and the charge current has tapered below 400mA (mirroring the
+vendor `charge_full` flag); UPower then shows a full charge.
 
 QC detection depends on D+/D- (DPDM): before running APSD, the charger switches the USB HS PHY
 through `dpdm-supply` to UTMI non-driving (high impedance), handing Dp/Dm to the SMB5 for handshake;
@@ -69,9 +70,8 @@ overlay therefore carries the vendor profile blob (K82 sunwoda 8720mAh, 416 byte
 cutoff/termination currents and empty voltage, then restarts the algorithm. With the profile
 loaded the reported percentage tracks the battery across the whole 0..100% range.
 
-`capacity` reports 100% once the SMB5 terminates the top-off
-(`POWER_SUPPLY_STATUS_FULL`) and 0% at the gauge's empty endpoint; the 1..99 range in
-between is scaled from the gauge's monotonic SOC.
+`capacity` reports 100% once the pack is full and 0% at the gauge's empty endpoint; the 1..99 range
+in between is scaled from the gauge's monotonic SOC.
 
 ## Layout
 

@@ -468,6 +468,7 @@ struct smb2_chip {
 	unsigned int bat_ov_bit;
 	int apsd_retries;
 	int online_retries;
+	bool charge_full;
 	bool is_smb5;
 };
 
@@ -567,6 +568,18 @@ static int smb2_get_prop_status(struct smb2_chip *chip, int *val)
 	if (!usb_online) {
 		*val = POWER_SUPPLY_STATUS_DISCHARGING;
 		return rc;
+	}
+
+	/*
+	 * The PM8150B ADC charge termination does not always fire on nabu,
+	 * so additionally latch "full" from the fuel gauge: 100% and a
+	 * tapered charge current. This mirrors the vendor charge_full flag
+	 * and keeps the reported status (and UPower) at "full" instead of
+	 * endlessly "charging".
+	 */
+	if (chip->is_smb5 && chip->charge_full) {
+		*val = POWER_SUPPLY_STATUS_FULL;
+		return 0;
 	}
 
 	rc = regmap_bulk_read(chip->regmap,
@@ -809,19 +822,55 @@ static void smb2_jeita_work(struct work_struct *work)
 	int usb_online = 0, temp, fcc_ua, fv_uv, rc;
 
 	smb2_get_prop_usb_online(chip, &usb_online);
-	if (!usb_online)
+	if (!usb_online) {
+		if (chip->charge_full) {
+			chip->charge_full = false;
+			power_supply_changed(chip->chg_psy);
+		}
 		return;
+	}
 
 	batt_psy = power_supply_get_by_name("qcom-battery");
 	if (!batt_psy)
 		goto resched;
 
 	rc = power_supply_get_property(batt_psy, POWER_SUPPLY_PROP_TEMP, &val);
-	power_supply_put(batt_psy);
-	if (rc)
+	if (rc) {
+		power_supply_put(batt_psy);
 		goto resched;
-
+	}
 	temp = val.intval;
+
+	/*
+	 * Software charge-complete latch, consumed by smb2_get_prop_status().
+	 * The fuel gauge reports capacity and a current with positive =
+	 * charging. Latch full at 100% with a tapered current, and clear it
+	 * again once the pack drops or charging resumes hard. Notify on every
+	 * change so the fuel gauge (and UPower) pick the new status up.
+	 */
+	rc = power_supply_get_property(batt_psy, POWER_SUPPLY_PROP_CAPACITY,
+				       &val);
+	if (!rc) {
+		int cap = val.intval;
+		int cur = 0;
+		bool full = chip->charge_full;
+
+		if (!power_supply_get_property(batt_psy,
+					       POWER_SUPPLY_PROP_CURRENT_NOW,
+					       &val))
+			cur = val.intval;
+
+		if (cap >= 100 && cur < 400000)
+			full = true;
+		else if (cap <= 98 || cur >= 500000)
+			full = false;
+
+		if (full != chip->charge_full) {
+			chip->charge_full = full;
+			power_supply_changed(chip->chg_psy);
+		}
+	}
+	power_supply_put(batt_psy);
 
 	if (temp < SMB2_JEITA_HARD_COLD || temp >= SMB2_JEITA_HARD_HOT) {
 		regmap_update_bits(chip->regmap, chip->base + CHARGING_ENABLE_CMD,
