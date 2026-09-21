@@ -16,8 +16,11 @@ Linux 内核树、预编译 UKI 或完整模块树。内核文件保留原始相
 
 - Qualcomm PM8150B SMB5 充电器（`qcom,pm8150b-charger`）：USB 检测、5V 基础
   充电，以及 QC2/QC3 HVDCP 升压
-- Qualcomm PM8150B 燃料计（`qcom,pm8150b-fg`），上报电量、电压、电流与温度
+- Qualcomm PM8150B 燃料计（`qcom,pm8150b-fg`），上报电量、电压、电流与温度，
+  并在启动时加载厂商电池 profile，保证全量程 SOC 精度
 - LionSemi LN8000 快充 IC（`lionsemi,ln8000`）：9V+ 输入下的 2:1 电荷泵
+- 软件 JEITA：按燃料计温度限制充电电流与浮充电压，超出 -10..59°C 时停充；
+  LN8000 电荷泵在 0..45°C 之外停止
 - 派生设备树追加电池、充电器与 PMIC 燃料计节点
 
 ## 充电链路
@@ -52,6 +55,17 @@ QC 识别依赖 D+/D-（DPDM）：充电器在跑 APSD 前会把 USB HS PHY 通�
 否则 APSD 只会把适配器判成 SDP/OCP。上述 5V、QC 9V 和充满终止/回充均已实机
 验证。
 
+## 电量状态
+
+Nabu 上 PM8150B 燃料计的 OTP 中没有可用的电池模型，因此在加载 profile 之前，
+SOC 算法输出的值没有意义（长期停在量程顶端附近）。因此本模块内置了厂商电池
+profile（K82 sunwoda 8720mAh，416 字节），`qcom_fg` 在 probe 时把它连同匹配的
+KI 系数、截止/终止电流和空电电压写入燃料计 SRAM，并重启算法。加载后上报的
+百分比会在 0..100% 全量程跟随电池实际状态。
+
+SMB5 结束涓流充满（`POWER_SUPPLY_STATUS_FULL`）时 `capacity` 上报 100%，
+燃料计空电端点上报 0%，中间 1..99 由单调 SOC 缩放得到。
+
 ## 目录
 
 ```text
@@ -67,7 +81,8 @@ LICENSES/         源码 SPDX 标识对应的许可证文本
 - `drivers/power/supply/qcom_pmi8998_charger.c`：在 mainline SMB2 驱动上扩展出
   PM8150B/SMB5 支持（50mA/10mV 步进、DCDC 状态寄存器偏移、跳过 Type-C/OTG 段、
   HVDCP、USBIN resume/MODE_CHG、清除 charge inhibit）；
-- `drivers/power/supply/qcom_fg.c`：状态接充电器、`CURRENT_NOW` 符号标准化；
+- `drivers/power/supply/qcom_fg.c`：状态接充电器、`CURRENT_NOW` 符号标准化、
+  满/空电量端点，以及 Gen4（PM8150B）SRAM 电池 profile 加载；
 - `drivers/power/supply/ln8000_charger.c`：秒级状态日志降为 debug；
 - 派生 DTS 片段与基线 DTS 拆分补丁。
 

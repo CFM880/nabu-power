@@ -257,6 +257,18 @@ enum ln8000_adc_hibernate_delay_desc {
 #define BUS_OCP_FOR_QC3P5_CLASS_B		3500000
 #define BUS_OCP_ALARM_FOR_QC3P5_CLASS_B	3200000
 
+/*
+ * Software thermal gating for the charge pump. The pump runs at high input
+ * current, so stop switching outside the safe battery temperature window
+ * (with hysteresis) and resume once the pack is back in range. The battery
+ * temperature comes from the fuel gauge; values are in tenths of a degree C.
+ */
+#define LN8000_THERMAL_LIMIT_COLD		0
+#define LN8000_THERMAL_CLEAR_COLD		20
+#define LN8000_THERMAL_CLEAR_HOT		420
+#define LN8000_THERMAL_LIMIT_HOT		450
+#define LN8000_THERMAL_POLL_MS			15000
+
 /**
  * driver instance structure definition
  */
@@ -294,6 +306,7 @@ struct ln8000_info {
     struct notifier_block nb;
     struct delayed_work status_changed_work;
     struct delayed_work charge_work;
+    struct delayed_work thermal_work;
     int status;
 
     struct mutex data_lock;
@@ -324,6 +337,7 @@ struct ln8000_info {
     bool usb_present;           /* usb plugged (present) */
     bool chg_en;                /* charging enavbled */
     bool rcp_en;                /* reverse current protection enabled */
+    bool thermal_limited;       /* charge pump stopped due to battery temp */
     int vbat_ovp_alarm_th;      /* vbat ovp alarm threshold */
     int vin_ovp_alarm_th;       /* vin ovp alarm threshold */
     int iin_ocp_alarm_th;       /* iin ocp alarm threshold */
@@ -1112,6 +1126,48 @@ static int psy_chg_set_charging_enable(struct ln8000_info *info, int val)
     return 0;
 }
 
+static void ln8000_thermal_work(struct work_struct *work)
+{
+    struct ln8000_info *info = container_of(work, struct ln8000_info,
+                                            thermal_work.work);
+    struct power_supply *batt_psy;
+    union power_supply_propval val;
+    int temp, rc;
+
+    if (!info->usb_present)
+        return;
+
+    batt_psy = power_supply_get_by_name("qcom-battery");
+    if (!batt_psy)
+        goto resched;
+
+    rc = power_supply_get_property(batt_psy, POWER_SUPPLY_PROP_TEMP, &val);
+    power_supply_put(batt_psy);
+    if (rc)
+        goto resched;
+
+    temp = val.intval;
+
+    if (!info->thermal_limited) {
+        if (temp <= LN8000_THERMAL_LIMIT_COLD ||
+            temp >= LN8000_THERMAL_LIMIT_HOT) {
+            ln_info("thermal: battery %d (0.1C), stopping charge pump\n",
+                    temp);
+            psy_chg_set_charging_enable(info, false);
+            info->thermal_limited = true;
+        }
+    } else if (temp > LN8000_THERMAL_CLEAR_COLD &&
+               temp < LN8000_THERMAL_CLEAR_HOT) {
+        ln_info("thermal: battery %d (0.1C), resuming charge pump\n", temp);
+        info->thermal_limited = false;
+        psy_chg_set_charging_enable(info, true);
+    }
+
+resched:
+    schedule_delayed_work(&info->thermal_work,
+                          msecs_to_jiffies(LN8000_THERMAL_POLL_MS));
+}
+
 static int psy_chg_set_present(struct ln8000_info *info, int val)
 {
     bool usb_present = (bool)val;
@@ -1536,8 +1592,10 @@ static int ln8000_notifier_call(struct notifier_block *nb,
 
         if (chip->usb_present) {
             msleep(100);
-            psy_chg_set_charging_enable(chip, true);
+            if (!chip->thermal_limited)
+                psy_chg_set_charging_enable(chip, true);
             schedule_delayed_work(&chip->charge_work, msecs_to_jiffies(0));
+            schedule_delayed_work(&chip->thermal_work, msecs_to_jiffies(0));
         }
         else {
             psy_chg_set_charging_enable(chip, false);
@@ -1637,6 +1695,7 @@ static int ln8000_probe(struct i2c_client *client)
 		INIT_DELAYED_WORK(&info->status_changed_work,
 			ln8000_status_changed_worker);
         INIT_DELAYED_WORK(&info->charge_work, psy_chg_get_ti_alarm_status);
+        INIT_DELAYED_WORK(&info->thermal_work, ln8000_thermal_work);
 
 		info->nb.notifier_call = ln8000_notifier_call;
 		ret = power_supply_reg_notifier(&info->nb);
@@ -1650,6 +1709,7 @@ static int ln8000_probe(struct i2c_client *client)
             ln_info("start charging on init\n");
             psy_chg_set_charging_enable(info, true);
             schedule_delayed_work(&info->charge_work, msecs_to_jiffies(0));
+            schedule_delayed_work(&info->thermal_work, msecs_to_jiffies(0));
         }
 	}
 
@@ -1681,6 +1741,8 @@ static void ln8000_remove(struct i2c_client *client)
 {
     struct ln8000_info *info = i2c_get_clientdata(client);
 
+    if (info->typec_psy)
+        cancel_delayed_work_sync(&info->thermal_work);
     ln8000_change_opmode(info, LN8000_OPMODE_STANDBY);
 
     if (client->irq) {

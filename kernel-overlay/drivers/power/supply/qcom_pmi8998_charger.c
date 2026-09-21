@@ -80,8 +80,12 @@
 
 #define CHGR_ADC_ITERM_UP_THD_MSB			0x67
 #define CHGR_ADC_ITERM_UP_THD_LSB			0x68
+#define CHGR_ADC_ITERM_LO_THD_MSB			0x69
+#define CHGR_ADC_ITERM_LO_THD_LSB			0x6A
 #define CHGR_ADC_TERM_CFG				0x6C
 #define TERM_BASED_ON_SAMPLE_CNT			1
+#define CHGR_ENG_CHARGING_CFG				0xC0
+#define CHGR_ITERM_USE_ANALOG_BIT			BIT(3)
 #define CHARGE_RCHG_SOC_THRESHOLD			0x7D
 
 #define FG_UPDATE_CFG_2_SEL				0x7D
@@ -365,6 +369,29 @@
 
 /* pmi8998 registers represent current in increments of 1/40th of an amp */
 #define CURRENT_SCALE_FACTOR				25000
+
+/*
+ * Software JEITA window for nabu, derived from the battery profile
+ * (fg-gen4-batterydata-nabu-sunwoda-8720mah): hard limits at -10C/59C,
+ * reduced charge current below 10C and a reduced float voltage above 48C.
+ * The PM8150B hardware soft-limit thresholds are raw thermistor ADC codes
+ * that are never programmed here, so temperature protection is applied in
+ * software from the fuel-gauge temperature instead.
+ * Temperatures are in tenths of a degree Celsius.
+ */
+#define SMB2_JEITA_HARD_COLD					(-100)
+#define SMB2_JEITA_TEMP_LOW					50
+#define SMB2_JEITA_TEMP_MID					100
+#define SMB2_JEITA_TEMP_WARM					480
+#define SMB2_JEITA_HARD_HOT					590
+#define SMB2_JEITA_LOW_FCC_UA					820000
+#define SMB2_JEITA_MID_FCC_UA					2500000
+#define SMB2_JEITA_WARM_FV_UV					4100000
+#define SMB2_JEITA_POLL_MS					15000
+
+/* Keep retrying APSD for a while so a slow adapter classification does not
+ * leave the charger stuck until the next re-plug. */
+#define SMB2_APSD_MAX_RETRIES					15
 /* clang-format on */
 
 enum charger_status {
@@ -418,6 +445,7 @@ struct smb2_chip {
 	struct power_supply_battery_info *batt_info;
 
 	struct delayed_work status_change_work;
+	struct delayed_work jeita_work;
 	int cable_irq;
 	bool wakeup_enabled;
 
@@ -434,10 +462,12 @@ struct smb2_chip {
 	unsigned int fv_base_uv;
 	unsigned int fv_step_uv;
 	unsigned int fv_max_uv;
+	unsigned int fv_uv;
 	unsigned int icl_status_reg;
 	unsigned int power_path_reg;
 	unsigned int bat_ov_bit;
 	int apsd_retries;
+	int online_retries;
 	bool is_smb5;
 };
 
@@ -634,15 +664,19 @@ static void smb2_status_change_work(struct work_struct *work)
 	smb2_get_prop_usb_online(chip, &usb_online);
 	if (!usb_online) {
 		/* The adapter may already be attached at boot before the power
-		 * path settles; retry a few times instead of relying on a
-		 * plug interrupt. */
-		if (chip->is_smb5 && chip->apsd_retries < 4) {
-			chip->apsd_retries++;
+		 * path settles; keep retrying instead of relying on a plug
+		 * interrupt that never comes for a boot-time cable. */
+		if (chip->is_smb5 && chip->online_retries < 30) {
+			chip->online_retries++;
 			schedule_delayed_work(&chip->status_change_work,
 					      msecs_to_jiffies(1000));
 		}
 		return;
 	}
+	chip->online_retries = 0;
+
+	/* The adapter is online: (re)start the software JEITA monitor. */
+	mod_delayed_work(system_wq, &chip->jeita_work, 0);
 
 	/* Release Dp/Dm from the USB PHY so the charger can run APSD/QC. */
 	if (chip->dpdm_reg) {
@@ -652,17 +686,21 @@ static void smb2_status_change_work(struct work_struct *work)
 	}
 
 	/*
-	 * APSD is asynchronous. Kick it and poll while Dp/Dm stay released;
-	 * re-running it without DPDM never completes.
+	 * APSD is asynchronous. Kick it once and then poll while Dp/Dm stay
+	 * released. Writing APSD_RERUN on every iteration restarts the
+	 * detection before it can finish, so the DTC status bit never
+	 * completes and the adapter is never classified (input then stays at
+	 * the low USB default and the battery slowly discharges).
 	 */
-	for (count = 0; count < 8; count++) {
-		dev_dbg(chip->dev, "get charger type retry %d\n", count);
+	regmap_update_bits(chip->regmap, chip->base + CMD_APSD,
+			   APSD_RERUN_BIT, APSD_RERUN_BIT);
+	for (count = 0; count < 20; count++) {
+		msleep(100);
 		rc = smb2_apsd_get_charger_type(chip, &charger_type);
 		if (rc != -EAGAIN)
 			break;
-		regmap_update_bits(chip->regmap, chip->base + CMD_APSD,
-				   APSD_RERUN_BIT, APSD_RERUN_BIT);
-		msleep(150);
+		dev_dbg(chip->dev, "charger type not ready yet (%d)\n",
+			count);
 	}
 
 	if (chip->dpdm_reg)
@@ -670,7 +708,8 @@ static void smb2_status_change_work(struct work_struct *work)
 
 	if (rc == -EAGAIN) {
 		dev_dbg(chip->dev, "apsd not ready, will retry\n");
-		if (chip->is_smb5 && chip->apsd_retries < 4) {
+		if (chip->is_smb5 &&
+		    chip->apsd_retries < SMB2_APSD_MAX_RETRIES) {
 			chip->apsd_retries++;
 			schedule_delayed_work(&chip->status_change_work,
 					      msecs_to_jiffies(2000));
@@ -701,6 +740,11 @@ static void smb2_status_change_work(struct work_struct *work)
 	}
 
 	smb2_set_current_limit(chip, current_ua);
+	dev_info(chip->dev, "APSD: charger type %s, input limit %uuA\n",
+		 charger_type == POWER_SUPPLY_USB_TYPE_DCP ? "DCP" :
+		 charger_type == POWER_SUPPLY_USB_TYPE_CDP ? "CDP" :
+		 charger_type == POWER_SUPPLY_USB_TYPE_SDP ? "SDP" : "unknown",
+		 current_ua);
 
 	if (chip->is_smb5 &&
 	    (charger_type == POWER_SUPPLY_USB_TYPE_DCP ||
@@ -717,7 +761,7 @@ static void smb2_status_change_work(struct work_struct *work)
 	 * mis-classified as SDP before D+/D- settle. Retry so the QC/HVDCP
 	 * handshake is performed without requiring a re-plug. */
 	if (chip->is_smb5 && charger_type == POWER_SUPPLY_USB_TYPE_SDP &&
-	    chip->apsd_retries < 4) {
+	    chip->apsd_retries < SMB2_APSD_MAX_RETRIES) {
 		chip->apsd_retries++;
 		schedule_delayed_work(&chip->status_change_work,
 				      msecs_to_jiffies(2000));
@@ -726,6 +770,87 @@ static void smb2_status_change_work(struct work_struct *work)
 	}
 
 	power_supply_changed(chip->chg_psy);
+}
+
+static int smb2_set_fast_charge_current(struct smb2_chip *chip, unsigned int ua)
+{
+	return regmap_update_bits(chip->regmap,
+				  chip->base + FAST_CHARGE_CURRENT_CFG,
+				  FAST_CHARGE_CURRENT_SETTING_MASK,
+				  ua / chip->curr_scale);
+}
+
+static int smb2_set_float_voltage(struct smb2_chip *chip, unsigned int uv)
+{
+	unsigned int raw;
+
+	if (uv < chip->fv_base_uv)
+		uv = chip->fv_base_uv;
+	raw = (uv - chip->fv_base_uv) / chip->fv_step_uv;
+
+	return regmap_update_bits(chip->regmap, chip->base + FLOAT_VOLTAGE_CFG,
+				  FLOAT_VOLTAGE_SETTING_MASK, raw);
+}
+
+/*
+ * Software JEITA. The PM8150B hardware soft-limit thresholds are raw
+ * thermistor ADC codes that are not programmed on nabu, so enabling them
+ * makes the charger latch a bogus over-temperature state and throttle
+ * charging. Instead read the (accurate) fuel-gauge temperature and bound the
+ * charge current and float voltage, disabling charging outside the safe
+ * window. This mirrors the downstream step-chg-jeita policy for this battery.
+ */
+static void smb2_jeita_work(struct work_struct *work)
+{
+	struct smb2_chip *chip = container_of(work, struct smb2_chip,
+					      jeita_work.work);
+	union power_supply_propval val;
+	struct power_supply *batt_psy;
+	int usb_online = 0, temp, fcc_ua, fv_uv, rc;
+
+	smb2_get_prop_usb_online(chip, &usb_online);
+	if (!usb_online)
+		return;
+
+	batt_psy = power_supply_get_by_name("qcom-battery");
+	if (!batt_psy)
+		goto resched;
+
+	rc = power_supply_get_property(batt_psy, POWER_SUPPLY_PROP_TEMP, &val);
+	power_supply_put(batt_psy);
+	if (rc)
+		goto resched;
+
+	temp = val.intval;
+
+	if (temp < SMB2_JEITA_HARD_COLD || temp >= SMB2_JEITA_HARD_HOT) {
+		regmap_update_bits(chip->regmap, chip->base + CHARGING_ENABLE_CMD,
+				   CHARGING_ENABLE_CMD_BIT, 0);
+		dev_info(chip->dev,
+			 "JEITA: battery %d (0.1C) out of range, charging disabled\n",
+			 temp);
+		goto resched;
+	}
+
+	regmap_update_bits(chip->regmap, chip->base + CHARGING_ENABLE_CMD,
+			   CHARGING_ENABLE_CMD_BIT, CHARGING_ENABLE_CMD_BIT);
+
+	if (temp < SMB2_JEITA_TEMP_LOW)
+		fcc_ua = SMB2_JEITA_LOW_FCC_UA;
+	else if (temp < SMB2_JEITA_TEMP_MID)
+		fcc_ua = SMB2_JEITA_MID_FCC_UA;
+	else
+		fcc_ua = chip->fcc_ua;
+
+	fv_uv = (temp >= SMB2_JEITA_TEMP_WARM) ? SMB2_JEITA_WARM_FV_UV
+						: chip->fv_uv;
+
+	smb2_set_fast_charge_current(chip, fcc_ua);
+	smb2_set_float_voltage(chip, fv_uv);
+
+resched:
+	schedule_delayed_work(&chip->jeita_work,
+			      msecs_to_jiffies(SMB2_JEITA_POLL_MS));
 }
 
 static int smb2_get_iio_chan(struct smb2_chip *chip, struct iio_channel *chan,
@@ -1009,7 +1134,8 @@ static const struct smb2_register smb2_init_seq[] = {
 
 static int smb2_init_hw(struct smb2_chip *chip)
 {
-	int rc, i, iterm;
+	u8 lobuf[2];
+	int rc, i, iterm, raw;
 
 	for (i = 0; i < ARRAY_SIZE(smb2_init_seq); i++) {
 		/* On SMB5 the Type-C/OTG blocks and the MISC status-pin config
@@ -1078,20 +1204,28 @@ static int smb2_init_hw(struct smb2_chip *chip)
 			return dev_err_probe(chip->dev, rc,
 					     "failed to clear charge inhibit\n");
 
-		/* Enable HVDCP (QC2/QC3) and let the PMIC negotiate the
-		 * high-voltage contract autonomously, so USB-A adapters can
-		 * raise VBUS beyond 5V. */
+		/*
+		 * Enable BC1.2 source detection (AUTO_SRC_DETECT, a.k.a.
+		 * BC1P2_SRC_DETECT) and HVDCP (QC2/QC3). Without the source
+		 * detection bit APSD never runs, so the DTC status never
+		 * completes and the charger type stays unclassified; the PMIC
+		 * then keeps the input at the low default and the adapter is
+		 * never asked for high voltage. The downstream driver enables
+		 * this in smblib_apsd_enable().
+		 */
 		rc = regmap_update_bits(chip->regmap,
 					chip->base + USBIN_OPTIONS_1_CFG,
+					AUTO_SRC_DETECT_BIT |
 					HVDCP_AUTH_ALG_EN_CFG_BIT |
 					HVDCP_EN_BIT |
 					HVDCP_AUTONOMOUS_MODE_EN_CFG_BIT,
+					AUTO_SRC_DETECT_BIT |
 					HVDCP_AUTH_ALG_EN_CFG_BIT |
 					HVDCP_EN_BIT |
 					HVDCP_AUTONOMOUS_MODE_EN_CFG_BIT);
 		if (rc < 0)
 			return dev_err_probe(chip->dev, rc,
-					     "failed to enable HVDCP\n");
+					     "failed to enable APSD/HVDCP\n");
 
 		/* Allow the adapter to raise VBUS to 9V (QC2, stable) so the
 		 * LN8000 charge pump can also run. */
@@ -1133,6 +1267,31 @@ static int smb2_init_hw(struct smb2_chip *chip)
 		if (rc < 0)
 			return dev_err_probe(chip->dev, rc,
 					     "failed to enable ADC termination\n");
+
+		/*
+		 * The PM8150B has both an analog and an ADC comparator for
+		 * charge termination. The analog path is not wired up on nabu,
+		 * so select the ADC comparator explicitly (the vendor driver
+		 * requires CHGR_ITERM_USE_ANALOG_BIT == 0) and program its low
+		 * threshold to 50mA like the vendor does. Without this the
+		 * charger never terminates and trickles at the CV voltage.
+		 */
+		raw = (50 * 32767) / 10000;
+		lobuf[0] = (raw >> 8) & 0xff;
+		lobuf[1] = raw & 0xff;
+		rc = regmap_bulk_write(chip->regmap,
+				       chip->base + CHGR_ADC_ITERM_LO_THD_MSB,
+				       lobuf, 2);
+		if (rc < 0)
+			return dev_err_probe(chip->dev, rc,
+					     "failed to set ITERM LO\n");
+
+		rc = regmap_update_bits(chip->regmap,
+					chip->base + CHGR_ENG_CHARGING_CFG,
+					CHGR_ITERM_USE_ANALOG_BIT, 0);
+		if (rc < 0)
+			return dev_err_probe(chip->dev, rc,
+					     "failed to select ADC termination\n");
 		/* Recharge automatically once the battery drops to 99%. */
 		rc = regmap_write(chip->regmap,
 				  chip->base + CHARGE_RCHG_SOC_THRESHOLD, 99);
@@ -1140,21 +1299,25 @@ static int smb2_init_hw(struct smb2_chip *chip)
 			return dev_err_probe(chip->dev, rc,
 					     "failed to set recharge threshold\n");
 
-		/* Keep hardware JEITA enabled for thermal protection. */
+		/*
+		 * Keep only the hardware hard limit. The hardware soft-limit
+		 * thresholds are raw thermistor ADC codes that are not
+		 * programmed on nabu (the battery profile only carries the
+		 * downstream software JEITA policy), so leaving them enabled
+		 * latches a bogus over-temperature state and throttles
+		 * charging. Temperature protection is applied in software from
+		 * the fuel gauge in smb2_jeita_work().
+		 */
 		rc = regmap_update_bits(chip->regmap, chip->base + JEITA_EN_CFG,
 					JEITA_EN_HARDLIMIT_BIT |
 					JEITA_EN_HOT_SL_FCV_BIT |
 					JEITA_EN_COLD_SL_FCV_BIT |
 					JEITA_EN_HOT_SL_CCC_BIT |
 					JEITA_EN_COLD_SL_CCC_BIT,
-					JEITA_EN_HARDLIMIT_BIT |
-					JEITA_EN_HOT_SL_FCV_BIT |
-					JEITA_EN_COLD_SL_FCV_BIT |
-					JEITA_EN_HOT_SL_CCC_BIT |
-					JEITA_EN_COLD_SL_CCC_BIT);
+					JEITA_EN_HARDLIMIT_BIT);
 		if (rc < 0)
 			return dev_err_probe(chip->dev, rc,
-					     "failed to enable JEITA\n");
+					     "failed to configure JEITA\n");
 
 		/* Conservative 1.5A default until APSD classifies the
 		 * charger; AICL will back off if the source is weaker. */
@@ -1277,9 +1440,16 @@ static int smb2_probe(struct platform_device *pdev)
 		return dev_err_probe(chip->dev, rc,
 				     "Failed to init status change work\n");
 
+	rc = devm_delayed_work_autocancel(chip->dev, &chip->jeita_work,
+					  smb2_jeita_work);
+	if (rc)
+		return dev_err_probe(chip->dev, rc,
+				     "Failed to init JEITA work\n");
+
 	fv_uv = chip->batt_info->voltage_max_design_uv;
 	if (chip->fv_max_uv && fv_uv > chip->fv_max_uv)
 		fv_uv = chip->fv_max_uv;
+	chip->fv_uv = fv_uv;
 	rc = (fv_uv - chip->fv_base_uv) / chip->fv_step_uv;
 	rc = regmap_update_bits(chip->regmap, chip->base + FLOAT_VOLTAGE_CFG,
 				FLOAT_VOLTAGE_SETTING_MASK, rc);

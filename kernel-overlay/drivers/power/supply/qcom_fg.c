@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright (c) 2020, The Linux Foundation. All rights reserved. */
 
+#include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/interrupt.h>
 #include <linux/kernel.h>
@@ -65,6 +66,90 @@
 
 #define MEM_IF_TIMEOUT_MS		5000
 #define SRAM_ACCESS_RELEASE_DELAY_MS	500
+
+/*
+ * GEN4 (PM8150B) SRAM / battery-profile support.
+ *
+ * Unlike the pre-Gen3 gauges, the PM8150B does not ship a usable battery
+ * model in OTP on the nabu: the hardware SOC algorithm only produces
+ * meaningful results after the 416-byte battery profile (the same blob the
+ * vendor kernel takes from qcom,fg-profile-data) is written into the gauge
+ * SRAM and the algorithm is restarted.  The registers below are shared with
+ * the PMI8998 driver but the Gen4 SRAM is addressed in 16-bit words, so the
+ * access helpers are a Gen4-specific variant of the interleaved IMA path the
+ * vendor driver uses.
+ */
+#define BATT_SOC_INT_RT_STS		0x010
+#define SOC_READY_BIT			BIT(1)
+#define BATT_SOC_RESTART		0x048
+#define RESTART_GO_BIT			BIT(0)
+
+#define MEM_INTF_IMA_OPR_STS(chip)	(chip->ops->memif_base + 0x54)
+#define IACS_RDY_BIT			BIT(1)
+#define MEM_INTF_ADDR_MSB(chip)		(chip->ops->memif_base + 0x62)
+#define MEM_INTF_WR_DATA1(chip)		(chip->ops->memif_base + 0x64)
+#define IACS_SLCT_BIT			BIT(5)
+
+/* Gen4 SRAM uses 16-bit words; the address register takes word addresses. */
+#define GEN4_BYTES_PER_WORD		2
+
+/* Battery profile and associated system parameters (word / byte offset). */
+#define PROFILE_LEN			416
+#define PROFILE_LOAD_WORD		65
+#define PROFILE_LOAD_OFFSET		0
+#define SYS_CONFIG_WORD			60
+#define SYS_CONFIG_OFFSET		0
+#define PROFILE_INTEGRITY_WORD		299
+#define PROFILE_INTEGRITY_OFFSET	0
+#define FIRST_LOG_CURRENT_WORD		471
+#define FIRST_LOG_CURRENT_OFFSET	0
+#define PROFILE_LOAD_BIT		BIT(0)
+#define HLOS_RESTART_BIT		BIT(3)
+
+#define CUTOFF_CURR_WORD		19
+#define CUTOFF_VOLT_WORD		20
+#define SYS_TERM_CURR_WORD		22
+#define KI_COEFF_LOW_DISCHG_WORD	25
+#define KI_COEFF_LOW_DISCHG_OFFSET	1
+#define KI_COEFF_MED_DISCHG_WORD	26
+#define KI_COEFF_MED_DISCHG_OFFSET	0
+#define KI_COEFF_HI_DISCHG_WORD		26
+#define KI_COEFF_HI_DISCHG_OFFSET	1
+#define KI_COEFF_LOW_CHG_WORD		28
+#define KI_COEFF_LOW_CHG_OFFSET		0
+#define KI_COEFF_MED_CHG_OFFSET		1
+#define DELTA_BSOC_THR_WORD		30
+#define DELTA_BSOC_THR_OFFSET		1
+#define DELTA_MSOC_THR_WORD		32
+#define DELTA_MSOC_THR_OFFSET		1
+#define VBATT_LOW_WORD			35
+#define VBATT_LOW_OFFSET		1
+
+/* Encodings copied from the vendor SRAM parameter table. */
+#define FG_CUTOFF_VOLT_NUM		1000000
+#define FG_CUTOFF_VOLT_DEN		244141
+#define FG_CURRENT_NUM			100000
+#define FG_CURRENT_DEN			48828
+#define FG_VBATT_LOW_NUM		1000
+#define FG_VBATT_LOW_DEN		15625
+#define FG_VBATT_LOW_OFFSET		(-2000)
+#define FG_KI_COEFF_NUM			1000
+#define FG_KI_COEFF_DEN			61035
+#define FG_DELTA_SOC_NUM		2048
+#define FG_DELTA_SOC_DEN		1000
+#define FG_DELTA_SOC_OFFSET		0
+
+/* nabu / K82 sunwoda 8720mAh defaults, matching the vendor FG node. */
+#define FG_CUTOFF_VOLT_MV		3400
+#define FG_CUTOFF_CURR_MA		200
+#define FG_SYS_TERM_CURR_MA		(-500)
+#define FG_EMPTY_VOLT_MV		3100
+#define FG_KI_COEFF_LOW_CHG		315
+#define FG_KI_COEFF_MED_CHG		183
+#define FG_KI_COEFF_LOW_DISCHG		367
+#define FG_KI_COEFF_MED_DISCHG		62
+#define FG_KI_COEFF_HI_DISCHG		0
+#define FG_DELTA_SOC_THR		5
 
 struct qcom_fg_chip;
 
@@ -499,7 +584,18 @@ static int qcom_fg_get_capacity(struct qcom_fg_chip *chip, int *val)
 		cap[0] = cap[0] < cap[1] ? cap[0] : cap[1];
 	}
 
-	*val = DIV_ROUND_CLOSEST((cap[0] - 1) * 98, 0xff - 2) + 1;
+	/*
+	 * 0x00 and 0xff are the fuel gauge's empty/full endpoints. Keep them
+	 * out of the 1..99 scaling so a full battery is reported as 100%
+	 * instead of being folded down to 99%; everything in between maps to
+	 * 1..99. This mirrors the vendor fg_get_msoc() encoding.
+	 */
+	if (cap[0] == 0xff)
+		*val = 100;
+	else if (cap[0] == 0)
+		*val = 0;
+	else
+		*val = DIV_ROUND_CLOSEST((cap[0] - 1) * 98, 0xff - 2) + 1;
 
 	return 0;
 }
@@ -918,7 +1014,16 @@ static int qcom_fg_get_property(struct power_supply *psy,
 		val->intval = POWER_SUPPLY_TECHNOLOGY_LION;
 		break;
 	case POWER_SUPPLY_PROP_CAPACITY:
-		ret = chip->ops->get_capacity(chip, &val->intval);
+		/*
+		 * The SMB5 reports the end of the CC/CV top-off through the
+		 * charger status. Surface that as 100% so the battery does not
+		 * appear stuck at the gauge's 99% ceiling while it is full.
+		 */
+		if (chip->chg_psy &&
+		    chip->status == POWER_SUPPLY_STATUS_FULL)
+			val->intval = 100;
+		else
+			ret = chip->ops->get_capacity(chip, &val->intval);
 		break;
 	case POWER_SUPPLY_PROP_CURRENT_NOW:
 		ret = chip->ops->get_current(chip, &val->intval);
@@ -978,7 +1083,7 @@ static const struct power_supply_desc batt_psy_desc = {
 static int qcom_fg_iacs_clear_sequence(struct qcom_fg_chip *chip)
 {
 	u8 temp;
-	int ret;
+	int data_off, ret;
 
 	/* clear the error */
 	ret = qcom_fg_masked_write(chip, MEM_INTF_IMA_CFG(chip), BIT(2), BIT(2));
@@ -994,16 +1099,22 @@ static int qcom_fg_iacs_clear_sequence(struct qcom_fg_chip *chip)
 		return ret;
 	}
 
+	/*
+	 * Gen4 (PM8150B) addresses SRAM in 16-bit words, so the second
+	 * data register is WR/RD_DATA1; older gauges use DATA3.
+	 */
+	data_off = (chip->ops == &ops_fg_gen4) ? 1 : 3;
+
 	temp = 0x0;
-	ret = qcom_fg_write(chip, &temp, MEM_INTF_WR_DATA0(chip) + 3, 1);
+	ret = qcom_fg_write(chip, &temp, MEM_INTF_WR_DATA0(chip) + data_off, 1);
 	if (ret) {
-		dev_err(chip->dev, "Failed to write WR_DATA3: %d\n", ret);
+		dev_err(chip->dev, "Failed to write WR_DATA: %d\n", ret);
 		return ret;
 	}
 
-	ret = qcom_fg_read(chip, &temp, MEM_INTF_RD_DATA0(chip) + 3, 1);
+	ret = qcom_fg_read(chip, &temp, MEM_INTF_RD_DATA0(chip) + data_off, 1);
 	if (ret) {
-		dev_err(chip->dev, "Failed to write RD_DATA3: %d\n", ret);
+		dev_err(chip->dev, "Failed to read RD_DATA: %d\n", ret);
 		return ret;
 	}
 
@@ -1140,6 +1251,387 @@ static int qcom_fg_notifier_call(struct notifier_block *nb,
 	}
 
 	return NOTIFY_OK;
+}
+
+/*****************************
+ * GEN4 (PM8150B) SOC PROFILE
+ * ***************************/
+
+static int qcom_fg_gen4_mem_access(struct qcom_fg_chip *chip, bool enable)
+{
+	u8 val;
+	int ret, i;
+
+	if (!enable)
+		return qcom_fg_masked_write(chip, MEM_INTF_CFG(chip),
+				RIF_MEM_ACCESS_REQ | IACS_SLCT_BIT, 0);
+
+	/*
+	 * Wait for any previous transaction to release the interface and
+	 * then request IMA access. The vendor hardware uses an inverting
+	 * MEM_ACCESS_REQ bit here.
+	 */
+	for (i = 0; i < 5; i++) {
+		ret = qcom_fg_read(chip, &val, MEM_INTF_CFG(chip), 1);
+		if (ret)
+			return ret;
+		if (!(val & RIF_MEM_ACCESS_REQ))
+			break;
+		usleep_range(4000, 4100);
+	}
+
+	if (val & RIF_MEM_ACCESS_REQ) {
+		dev_err(chip->dev, "FG SRAM access not released\n");
+		return -EBUSY;
+	}
+
+	val = RIF_MEM_ACCESS_REQ | IACS_SLCT_BIT;
+	return qcom_fg_write(chip, &val, MEM_INTF_CFG(chip), 1);
+}
+
+static int qcom_fg_gen4_iacs_ready(struct qcom_fg_chip *chip)
+{
+	u8 val;
+	int ret, i;
+
+	usleep_range(30, 35);
+	for (i = 0; i < 250; i++) {
+		ret = qcom_fg_read(chip, &val, MEM_INTF_IMA_OPR_STS(chip), 1);
+		if (ret)
+			return ret;
+		if (val & IACS_RDY_BIT)
+			return 0;
+		usleep_range(5000, 7000);
+	}
+
+	dev_err(chip->dev, "IACS_RDY not set (opr_sts=0x%x)\n", val);
+	return -EBUSY;
+}
+
+static int qcom_fg_gen4_set_address(struct qcom_fg_chip *chip, u16 word)
+{
+	u8 buf[2] = { word & 0xff, word >> 8 };
+
+	return qcom_fg_write(chip, buf, MEM_INTF_ADDR_LSB(chip), 2);
+}
+
+/*
+ * Gen4 SRAM transactions. The address register takes 16-bit word addresses
+ * and the data registers hold 16-bit words, matching the vendor driver.
+ */
+static int qcom_fg_gen4_sram_rw(struct qcom_fg_chip *chip, bool write,
+		u16 word, u8 offset, u8 *val, int len)
+{
+	u8 *ptr = val, num_bytes, byte_en, dummy = 0;
+	bool burst = (offset + len) > GEN4_BYTES_PER_WORD;
+	int ret, i;
+
+	ret = qcom_fg_gen4_mem_access(chip, true);
+	if (ret)
+		return ret;
+
+	ret = qcom_fg_sram_config_access(chip, write, burst);
+	if (ret) {
+		dev_err(chip->dev, "failed to configure SRAM access: %d\n", ret);
+		goto release;
+	}
+
+	ret = qcom_fg_gen4_iacs_ready(chip);
+	if (ret)
+		goto release;
+
+	ret = qcom_fg_gen4_set_address(chip, word);
+	if (ret)
+		goto release;
+
+	ret = qcom_fg_gen4_iacs_ready(chip);
+	if (ret)
+		goto release;
+
+	while (len > 0) {
+		num_bytes = (offset + len) > GEN4_BYTES_PER_WORD ?
+			(GEN4_BYTES_PER_WORD - offset) : len;
+
+		if (!write) {
+			ret = qcom_fg_read(chip, ptr,
+					MEM_INTF_RD_DATA0(chip) + offset,
+					num_bytes);
+			if (ret)
+				goto release;
+		} else {
+			byte_en = 0;
+			for (i = offset; i < offset + num_bytes; i++)
+				byte_en |= BIT(i);
+
+			ret = qcom_fg_write(chip, &byte_en,
+					MEM_INTF_IMA_BYTE_EN(chip), 1);
+			if (ret)
+				goto release;
+
+			ret = qcom_fg_write(chip, ptr,
+					MEM_INTF_WR_DATA0(chip) + offset,
+					num_bytes);
+			if (ret)
+				goto release;
+
+			/*
+			 * The last byte write starts the transaction; poke
+			 * WR_DATA1 when it carries no valid data.
+			 */
+			if (!(byte_en & BIT(1))) {
+				ret = qcom_fg_write(chip, &dummy,
+						MEM_INTF_WR_DATA1(chip), 1);
+				if (ret)
+					goto release;
+			}
+		}
+
+		ret = qcom_fg_clear_ima(chip, false);
+		if (ret && ret != -EAGAIN)
+			goto release;
+
+		ptr += num_bytes;
+		len -= num_bytes;
+		offset = 0;
+
+		ret = qcom_fg_gen4_iacs_ready(chip);
+		if (ret)
+			goto release;
+	}
+	ret = 0;
+
+release:
+	qcom_fg_gen4_mem_access(chip, false);
+	return ret;
+}
+
+static int qcom_fg_gen4_sram_write(struct qcom_fg_chip *chip, u16 word,
+		u8 offset, const u8 *val, int len)
+{
+	return qcom_fg_gen4_sram_rw(chip, true, word, offset, (u8 *)val, len);
+}
+
+static int qcom_fg_gen4_sram_read(struct qcom_fg_chip *chip, u16 word,
+		u8 offset, u8 *val, int len)
+{
+	return qcom_fg_gen4_sram_rw(chip, false, word, offset, val, len);
+}
+
+static int qcom_fg_gen4_sram_masked_write(struct qcom_fg_chip *chip,
+		u16 word, u8 offset, u8 mask, u8 val)
+{
+	u8 reg;
+	int ret;
+
+	ret = qcom_fg_gen4_sram_read(chip, word, offset, &reg, 1);
+	if (ret)
+		return ret;
+
+	reg &= ~mask;
+	reg |= val & mask;
+
+	return qcom_fg_gen4_sram_write(chip, word, offset, &reg, 1);
+}
+
+/* Encode and store a value using a vendor SRAM parameter scaling. */
+static int qcom_fg_gen4_sram_encode(struct qcom_fg_chip *chip, u16 word,
+		u8 offset, int val, int num, int den, int vofs, int len)
+{
+	u8 buf[4] = {};
+	s64 tmp;
+	int i;
+
+	tmp = div_s64((s64)(val + vofs) * num, den);
+	for (i = 0; i < len; i++) {
+		buf[i] = tmp & 0xff;
+		tmp >>= 8;
+	}
+
+	return qcom_fg_gen4_sram_write(chip, word, offset, buf, len);
+}
+
+static int qcom_fg_gen4_restart(struct qcom_fg_chip *chip)
+{
+	u8 val;
+	int ret, i;
+
+	ret = qcom_fg_masked_write(chip, BATT_SOC_RESTART, RESTART_GO_BIT,
+			RESTART_GO_BIT);
+	if (ret)
+		return ret;
+
+	for (i = 0; i < 100; i++) {
+		ret = qcom_fg_read(chip, &val, BATT_SOC_INT_RT_STS, 1);
+		if (ret)
+			break;
+		if (val & SOC_READY_BIT)
+			break;
+		msleep(10);
+	}
+
+	if (i == 100)
+		dev_warn(chip->dev, "SOC ready timed out\n");
+
+	return qcom_fg_masked_write(chip, BATT_SOC_RESTART, RESTART_GO_BIT, 0);
+}
+
+static int qcom_fg_gen4_write_params(struct qcom_fg_chip *chip)
+{
+	struct device_node *np = chip->dev->of_node;
+	u32 v;
+	int cut_v = FG_CUTOFF_VOLT_MV, cut_c = FG_CUTOFF_CURR_MA;
+	int term = FG_SYS_TERM_CURR_MA, empty = FG_EMPTY_VOLT_MV;
+	int ki_low = FG_KI_COEFF_LOW_CHG, ki_med = FG_KI_COEFF_MED_CHG;
+	int delta = FG_DELTA_SOC_THR;
+	int ret;
+
+	if (!of_property_read_u32(np, "qcom,fg-cutoff-voltage", &v))
+		cut_v = v;
+	if (!of_property_read_u32(np, "qcom,fg-cutoff-current", &v))
+		cut_c = (s32)v;
+	if (!of_property_read_u32(np, "qcom,fg-sys-term-current", &v))
+		term = (s32)v;
+	if (!of_property_read_u32(np, "qcom,fg-empty-voltage", &v))
+		empty = v;
+	if (!of_property_read_u32(np, "qcom,ki-coeff-low-chg", &v))
+		ki_low = v;
+	if (!of_property_read_u32(np, "qcom,ki-coeff-med-chg", &v))
+		ki_med = v;
+	if (!of_property_read_u32(np, "qcom,fg-delta-soc-thr", &v))
+		delta = v;
+
+	ret = qcom_fg_gen4_sram_encode(chip, CUTOFF_VOLT_WORD, 0, cut_v,
+			FG_CUTOFF_VOLT_NUM, FG_CUTOFF_VOLT_DEN, 0, 2);
+	if (ret)
+		return ret;
+
+	ret = qcom_fg_gen4_sram_encode(chip, CUTOFF_CURR_WORD, 0, cut_c,
+			FG_CURRENT_NUM, FG_CURRENT_DEN, 0, 2);
+	if (ret)
+		return ret;
+
+	ret = qcom_fg_gen4_sram_encode(chip, SYS_TERM_CURR_WORD, 0, term,
+			FG_CURRENT_NUM, FG_CURRENT_DEN, 0, 2);
+	if (ret)
+		return ret;
+
+	ret = qcom_fg_gen4_sram_encode(chip, VBATT_LOW_WORD, VBATT_LOW_OFFSET,
+			empty, FG_VBATT_LOW_NUM, FG_VBATT_LOW_DEN,
+			FG_VBATT_LOW_OFFSET, 1);
+	if (ret)
+		return ret;
+
+	ret = qcom_fg_gen4_sram_encode(chip, DELTA_MSOC_THR_WORD,
+			DELTA_MSOC_THR_OFFSET, delta, FG_DELTA_SOC_NUM,
+			FG_DELTA_SOC_DEN, 0, 1);
+	if (ret)
+		return ret;
+
+	ret = qcom_fg_gen4_sram_encode(chip, DELTA_BSOC_THR_WORD,
+			DELTA_BSOC_THR_OFFSET, delta, FG_DELTA_SOC_NUM,
+			FG_DELTA_SOC_DEN, 0, 1);
+	if (ret)
+		return ret;
+
+	ret = qcom_fg_gen4_sram_encode(chip, KI_COEFF_LOW_CHG_WORD,
+			KI_COEFF_LOW_CHG_OFFSET, ki_low, FG_KI_COEFF_NUM,
+			FG_KI_COEFF_DEN, 0, 1);
+	if (ret)
+		return ret;
+
+	ret = qcom_fg_gen4_sram_encode(chip, KI_COEFF_LOW_CHG_WORD,
+			KI_COEFF_MED_CHG_OFFSET, ki_med, FG_KI_COEFF_NUM,
+			FG_KI_COEFF_DEN, 0, 1);
+	if (ret)
+		return ret;
+
+	ret = qcom_fg_gen4_sram_encode(chip, KI_COEFF_LOW_DISCHG_WORD,
+			KI_COEFF_LOW_DISCHG_OFFSET, FG_KI_COEFF_LOW_DISCHG,
+			FG_KI_COEFF_NUM, FG_KI_COEFF_DEN, 0, 1);
+	if (ret)
+		return ret;
+
+	ret = qcom_fg_gen4_sram_encode(chip, KI_COEFF_MED_DISCHG_WORD,
+			KI_COEFF_MED_DISCHG_OFFSET, FG_KI_COEFF_MED_DISCHG,
+			FG_KI_COEFF_NUM, FG_KI_COEFF_DEN, 0, 1);
+	if (ret)
+		return ret;
+
+	return qcom_fg_gen4_sram_encode(chip, KI_COEFF_HI_DISCHG_WORD,
+			KI_COEFF_HI_DISCHG_OFFSET, FG_KI_COEFF_HI_DISCHG,
+			FG_KI_COEFF_NUM, FG_KI_COEFF_DEN, 0, 1);
+}
+
+static int qcom_fg_gen4_load_profile(struct qcom_fg_chip *chip)
+{
+	struct device_node *np = chip->dev->of_node;
+	const u8 *profile;
+	u8 val, zero[2] = {};
+	int plen, ret;
+
+	profile = of_get_property(np, "qcom,fg-profile-data", &plen);
+	if (!profile || plen != PROFILE_LEN) {
+		dev_err(chip->dev,
+			"missing or invalid qcom,fg-profile-data (len=%d, want %d)\n",
+			plen, PROFILE_LEN);
+		return -EINVAL;
+	}
+
+	/* Quiesce the gauge algorithm while the profile is replaced. */
+	ret = qcom_fg_masked_write(chip, BATT_SOC_RESTART, RESTART_GO_BIT, 0);
+	if (ret)
+		return ret;
+
+	ret = qcom_fg_gen4_sram_write(chip, PROFILE_LOAD_WORD,
+			PROFILE_LOAD_OFFSET, profile, PROFILE_LEN);
+	if (ret) {
+		dev_err(chip->dev, "failed to write battery profile: %d\n",
+			ret);
+		return ret;
+	}
+
+	/* Allow the algorithm to side-load voltage/current. */
+	ret = qcom_fg_gen4_sram_masked_write(chip, SYS_CONFIG_WORD,
+			SYS_CONFIG_OFFSET, BIT(0), BIT(0));
+	if (ret)
+		return ret;
+
+	ret = qcom_fg_gen4_sram_write(chip, FIRST_LOG_CURRENT_WORD,
+			FIRST_LOG_CURRENT_OFFSET, zero, 2);
+	if (ret)
+		return ret;
+
+	/* Mark the profile valid and ask the gauge to restart. */
+	val = PROFILE_LOAD_BIT | HLOS_RESTART_BIT;
+	ret = qcom_fg_gen4_sram_write(chip, PROFILE_INTEGRITY_WORD,
+			PROFILE_INTEGRITY_OFFSET, &val, 1);
+	if (ret)
+		return ret;
+
+	ret = qcom_fg_gen4_restart(chip);
+	if (ret)
+		return ret;
+
+	ret = qcom_fg_gen4_sram_masked_write(chip, SYS_CONFIG_WORD,
+			SYS_CONFIG_OFFSET, BIT(0), 0);
+	if (ret)
+		return ret;
+
+	dev_info(chip->dev, "battery profile loaded, gauge restarted\n");
+	return 0;
+}
+
+static int qcom_fg_gen4_configure(struct qcom_fg_chip *chip)
+{
+	int ret;
+
+	ret = qcom_fg_gen4_write_params(chip);
+	if (ret) {
+		dev_err(chip->dev, "failed to write SOC parameters: %d\n", ret);
+		return ret;
+	}
+
+	return qcom_fg_gen4_load_profile(chip);
 }
 
 static int qcom_fg_probe(struct platform_device *pdev)
@@ -1352,6 +1844,19 @@ static int qcom_fg_probe(struct platform_device *pdev)
 						&propval);
 		if (!ret)
 			chip->status = propval.intval;
+	}
+
+	/*
+	 * PM8150B ships no usable battery model on nabu, so push the vendor
+	 * profile and SOC parameters into the gauge before userspace starts.
+	 * A failure is not fatal: charging and the raw gauge still work.
+	 */
+	if (chip->ops == &ops_fg_gen4) {
+		ret = qcom_fg_gen4_configure(chip);
+		if (ret)
+			dev_warn(chip->dev,
+				 "PM8150B fuel gauge profile setup failed: %d\n",
+				 ret);
 	}
 
 	return 0;

@@ -80,8 +80,12 @@ Driver changes maintained directly in this repository:
 - `qcom_fg.c`: avoid reading an uninitialized `propval.intval` in the charger
   notifier, return `-EPROBE_DEFER` when a DT-described charger supply is not
   registered yet, take the battery status from the charger
-  (`power-supplies`) so it does not oscillate around zero net current, and
-  report `CURRENT_NOW` with the standard sign (positive = charging);
+  (`power-supplies`) so it does not oscillate around zero net current,
+  report `CURRENT_NOW` with the standard sign (positive = charging), map the
+  full/empty capacity endpoints correctly, and add a Gen4 (PM8150B) interleaved
+  IMA SRAM path plus a battery-profile loader that writes the vendor
+  `qcom,fg-profile-data` blob and the SOC parameters into the gauge at probe
+  (the PM8150B has no usable OTP battery model);
 - `ln8000_charger.c`: demote the per-second `psy_chg_get_ti_alarm_status`
   register dump from info to debug.
 

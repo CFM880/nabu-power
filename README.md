@@ -18,8 +18,10 @@ original relative paths, so they can be overlaid onto a chosen baseline for revi
 - Qualcomm PM8150B SMB5 charger (`qcom,pm8150b-charger`): USB detection, basic 5V charging, and
   QC2/QC3 HVDCP boost
 - Qualcomm PM8150B fuel gauge (`qcom,pm8150b-fg`), reporting capacity, voltage, current, and
-  temperature
+  temperature, with the vendor battery profile loaded at boot for full-range SOC accuracy
 - LionSemi LN8000 fast-charge IC (`lionsemi,ln8000`): 2:1 charge pump for 9V+ input
+- Software JEITA: charge current/float voltage limited from the fuel-gauge temperature, with
+  charging disabled outside -10..59°C; the LN8000 charge pump is stopped outside 0..45°C
 - Derived device tree appends battery, charger, and PMIC fuel gauge nodes
 
 ## Charging path
@@ -58,6 +60,19 @@ through `dpdm-supply` to UTMI non-driving (high impedance), handing Dp/Dm to the
 otherwise APSD would only identify the adapter as SDP/OCP. The 5V, QC 9V, and full-charge
 termination/recharge behaviors above have all been verified on real hardware.
 
+## State of charge
+
+The PM8150B fuel gauge has no usable battery model in OTP on nabu, so its SOC algorithm
+returns a meaningless value (it sits near the top of its range) until a profile is loaded. The
+overlay therefore carries the vendor profile blob (K82 sunwoda 8720mAh, 416 bytes) and
+`qcom_fg` writes it into gauge SRAM during probe, together with the matching KI coefficients,
+cutoff/termination currents and empty voltage, then restarts the algorithm. With the profile
+loaded the reported percentage tracks the battery across the whole 0..100% range.
+
+`capacity` reports 100% once the SMB5 terminates the top-off
+(`POWER_SUPPLY_STATUS_FULL`) and 0% at the gauge's empty endpoint; the 1..99 range in
+between is scaled from the gauge's monotonic SOC.
+
 ## Layout
 
 ```text
@@ -73,7 +88,8 @@ The power overlay contains:
 - `drivers/power/supply/qcom_pmi8998_charger.c`: extends the mainline SMB2 driver with
   PM8150B/SMB5 support (50mA/10mV steps, DCDC status register offsets, skipping the Type-C/OTG
   section, HVDCP, USBIN resume/MODE_CHG, clearing charge inhibit);
-- `drivers/power/supply/qcom_fg.c`: status wired to the charger, `CURRENT_NOW` sign normalized;
+- `drivers/power/supply/qcom_fg.c`: status wired to the charger, `CURRENT_NOW` sign normalized,
+  full/empty capacity endpoints, and a Gen4 (PM8150B) SRAM battery-profile loader;
 - `drivers/power/supply/ln8000_charger.c`: per-second status logs demoted to debug;
 - Derived DTS fragments and baseline DTS split patches.
 
