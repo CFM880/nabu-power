@@ -388,6 +388,8 @@
 #define SMB2_JEITA_MID_FCC_UA					2500000
 #define SMB2_JEITA_WARM_FV_UV					4100000
 #define SMB2_JEITA_POLL_MS					15000
+/* Charge current considered "tapered" for the software full latch. */
+#define SMB2_FULL_CUR_UA					1300000
 
 /* Keep retrying APSD for a while so a slow adapter classification does not
  * leave the charger stuck until the next re-plug. */
@@ -490,6 +492,8 @@ static enum power_supply_property smb2_properties[] = {
 	POWER_SUPPLY_PROP_MANUFACTURER,
 	POWER_SUPPLY_PROP_MODEL_NAME,
 	POWER_SUPPLY_PROP_CURRENT_MAX,
+	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX,
+	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT,
 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
 	POWER_SUPPLY_PROP_STATUS,
 	POWER_SUPPLY_PROP_HEALTH,
@@ -689,7 +693,7 @@ static void smb2_status_change_work(struct work_struct *work)
 	chip->online_retries = 0;
 
 	/* The adapter is online: (re)start the software JEITA monitor. */
-	mod_delayed_work(system_wq, &chip->jeita_work, 0);
+	mod_delayed_work(system_percpu_wq, &chip->jeita_work, 0);
 
 	/* Release Dp/Dm from the USB PHY so the charger can run APSD/QC. */
 	if (chip->dpdm_reg) {
@@ -854,15 +858,27 @@ static void smb2_jeita_work(struct work_struct *work)
 		int cap = val.intval;
 		int cur = 0;
 		bool full = chip->charge_full;
+		bool tapered;
 
 		if (!power_supply_get_property(batt_psy,
 					       POWER_SUPPLY_PROP_CURRENT_NOW,
 					       &val))
 			cur = val.intval;
 
-		if (cap >= 100 && cur < 400000)
+		/*
+		 * Normal CC/CV termination, matching the vendor FFC policy:
+		 * the LN8000 charge pump stands down near the float voltage so
+		 * the SMB5 alone ramps down in CV, and the charge is considered
+		 * complete once that current tapers to the vendor termination
+		 * current (~1.3A, qcom,ffc-*-term-current-ma). Keep charging
+		 * until then instead of cutting at the float voltage, so the
+		 * CV taper is not truncated.
+		 */
+		tapered = (cur > 0 && cur < SMB2_FULL_CUR_UA);
+
+		if (cap >= 100 && tapered)
 			full = true;
-		else if (cap <= 98 || cur >= 500000)
+		else if (cap <= 98)
 			full = false;
 
 		if (full != chip->charge_full) {
@@ -871,6 +887,14 @@ static void smb2_jeita_work(struct work_struct *work)
 		}
 	}
 	power_supply_put(batt_psy);
+
+	if (chip->charge_full) {
+		regmap_update_bits(chip->regmap, chip->base + CHARGING_ENABLE_CMD,
+				   CHARGING_ENABLE_CMD_BIT, 0);
+		dev_info(chip->dev,
+			 "battery full (tapered), charging disabled\n");
+		goto resched;
+	}
 
 	if (temp < SMB2_JEITA_HARD_COLD || temp >= SMB2_JEITA_HARD_HOT) {
 		regmap_update_bits(chip->regmap, chip->base + CHARGING_ENABLE_CMD,
@@ -967,6 +991,12 @@ static int smb2_get_property(struct power_supply *psy,
 		return 0;
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
 		return smb2_get_current_limit(chip, &val->intval);
+	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT:
+		val->intval = chip->fcc_ua;
+		return 0;
+	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX:
+		val->intval = chip->curr_max_ua;
+		return 0;
 	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
 		return smb2_get_iio_chan(chip, chip->usb_in_v_chan,
 					 &val->intval);
@@ -993,6 +1023,12 @@ static int smb2_set_property(struct power_supply *psy,
 	switch (psp) {
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
 		return smb2_set_current_limit(chip, val->intval);
+	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT:
+		if (val->intval < 0 || val->intval > chip->curr_max_ua)
+			return -EINVAL;
+
+		chip->fcc_ua = val->intval;
+		return smb2_set_fast_charge_current(chip, chip->fcc_ua);
 	default:
 		dev_err(chip->dev, "No setter for property: %d\n", psp);
 		return -EINVAL;
@@ -1004,6 +1040,7 @@ static int smb2_property_is_writable(struct power_supply *psy,
 {
 	switch (psp) {
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
+	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT:
 		return 1;
 	default:
 		return 0;
@@ -1461,7 +1498,7 @@ static int smb2_probe(struct platform_device *pdev)
 		return rc;
 
 	supply_config.drv_data = chip;
-	supply_config.of_node = pdev->dev.of_node;
+	supply_config.fwnode = dev_fwnode(&pdev->dev);
 
 	desc = devm_kzalloc(chip->dev, sizeof(smb2_psy_desc), GFP_KERNEL);
 	if (!desc)

@@ -109,6 +109,8 @@
 #define CUTOFF_CURR_WORD		19
 #define CUTOFF_VOLT_WORD		20
 #define SYS_TERM_CURR_WORD		22
+#define VBATT_FULL_WORD			23
+#define VBATT_FULL_OFFSET		0
 #define KI_COEFF_LOW_DISCHG_WORD	25
 #define KI_COEFF_LOW_DISCHG_OFFSET	1
 #define KI_COEFF_MED_DISCHG_WORD	26
@@ -144,6 +146,7 @@
 #define FG_CUTOFF_CURR_MA		200
 #define FG_SYS_TERM_CURR_MA		(-500)
 #define FG_EMPTY_VOLT_MV		3100
+#define FG_VBATT_FULL_MV		4450
 #define FG_KI_COEFF_LOW_CHG		315
 #define FG_KI_COEFF_MED_CHG		183
 #define FG_KI_COEFF_LOW_DISCHG		367
@@ -1481,6 +1484,7 @@ static int qcom_fg_gen4_write_params(struct qcom_fg_chip *chip)
 	u32 v;
 	int cut_v = FG_CUTOFF_VOLT_MV, cut_c = FG_CUTOFF_CURR_MA;
 	int term = FG_SYS_TERM_CURR_MA, empty = FG_EMPTY_VOLT_MV;
+	int vbatt_full = FG_VBATT_FULL_MV;
 	int ki_low = FG_KI_COEFF_LOW_CHG, ki_med = FG_KI_COEFF_MED_CHG;
 	int delta = FG_DELTA_SOC_THR;
 	int ret;
@@ -1493,6 +1497,8 @@ static int qcom_fg_gen4_write_params(struct qcom_fg_chip *chip)
 		term = (s32)v;
 	if (!of_property_read_u32(np, "qcom,fg-empty-voltage", &v))
 		empty = v;
+	if (!of_property_read_u32(np, "qcom,fg-cc-cv-threshold-mv", &v))
+		vbatt_full = v;
 	if (!of_property_read_u32(np, "qcom,ki-coeff-low-chg", &v))
 		ki_low = v;
 	if (!of_property_read_u32(np, "qcom,ki-coeff-med-chg", &v))
@@ -1502,6 +1508,16 @@ static int qcom_fg_gen4_write_params(struct qcom_fg_chip *chip)
 
 	ret = qcom_fg_gen4_sram_encode(chip, CUTOFF_VOLT_WORD, 0, cut_v,
 			FG_CUTOFF_VOLT_NUM, FG_CUTOFF_VOLT_DEN, 0, 2);
+	if (ret)
+		return ret;
+
+	/*
+	 * VBATT_FULL: the pack voltage at which the gauge considers itself
+	 * full (vendor qcom,fg-cc-cv-threshold-mv). Shares the CUTOFF_VOLT
+	 * voltage encoding, in mV.
+	 */
+	ret = qcom_fg_gen4_sram_encode(chip, VBATT_FULL_WORD, VBATT_FULL_OFFSET,
+			vbatt_full, FG_CUTOFF_VOLT_NUM, FG_CUTOFF_VOLT_DEN, 0, 2);
 	if (ret)
 		return ret;
 
@@ -1562,6 +1578,41 @@ static int qcom_fg_gen4_write_params(struct qcom_fg_chip *chip)
 			FG_KI_COEFF_NUM, FG_KI_COEFF_DEN, 0, 1);
 }
 
+/*
+ * Skip reloading the profile (and restarting the gauge) when the SRAM
+ * already holds the same profile. The gauge then keeps its coulomb-counted
+ * SOC across a warm reboot instead of re-estimating it from the relaxed
+ * open-circuit voltage, which is what made the reported capacity drop by
+ * ~10% on every reboot.
+ */
+static bool qcom_fg_gen4_profile_load_required(struct qcom_fg_chip *chip,
+					       const u8 *profile)
+{
+	u8 val, buf[PROFILE_LEN];
+	int ret;
+
+	ret = qcom_fg_gen4_sram_read(chip, PROFILE_INTEGRITY_WORD,
+			PROFILE_INTEGRITY_OFFSET, &val, 1);
+	if (ret)
+		return true;
+
+	if (!(val & PROFILE_LOAD_BIT))
+		return true;
+
+	ret = qcom_fg_gen4_sram_read(chip, PROFILE_LOAD_WORD,
+			PROFILE_LOAD_OFFSET, buf, PROFILE_LEN);
+	if (ret)
+		return true;
+
+	if (memcmp(buf, profile, PROFILE_LEN)) {
+		dev_info(chip->dev, "battery profile differs, reloading\n");
+		return true;
+	}
+
+	dev_info(chip->dev, "battery profile unchanged, keeping gauge SOC\n");
+	return false;
+}
+
 static int qcom_fg_gen4_load_profile(struct qcom_fg_chip *chip)
 {
 	struct device_node *np = chip->dev->of_node;
@@ -1576,6 +1627,9 @@ static int qcom_fg_gen4_load_profile(struct qcom_fg_chip *chip)
 			plen, PROFILE_LEN);
 		return -EINVAL;
 	}
+
+	if (!qcom_fg_gen4_profile_load_required(chip, profile))
+		return 0;
 
 	/* Quiesce the gauge algorithm while the profile is replaced. */
 	ret = qcom_fg_masked_write(chip, BATT_SOC_RESTART, RESTART_GO_BIT, 0);
@@ -1701,7 +1755,7 @@ static int qcom_fg_probe(struct platform_device *pdev)
 	}
 
 	supply_config.drv_data = chip;
-	supply_config.of_node = pdev->dev.of_node;
+	supply_config.fwnode = dev_fwnode(&pdev->dev);
 
 	chip->batt_psy = devm_power_supply_register(chip->dev,
 			&batt_psy_desc, &supply_config);
@@ -1804,7 +1858,7 @@ static int qcom_fg_probe(struct platform_device *pdev)
 	}
 
 	/* Optional: Get charger power supply for status checking */
-	chip->chg_psy = power_supply_get_by_phandle(chip->dev->of_node,
+	chip->chg_psy = devm_power_supply_get_by_reference(chip->dev,
 							"power-supplies");
 	if (chip->chg_psy == ERR_PTR(-ENODEV)) {
 		/* No charger supply described in DT; battery still works */

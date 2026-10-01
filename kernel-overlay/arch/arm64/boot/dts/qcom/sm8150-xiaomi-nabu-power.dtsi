@@ -134,17 +134,41 @@
 	qcom,fg-cutoff-current = <200>;
 	qcom,fg-sys-term-current = <(-500)>;
 	qcom,fg-empty-voltage = <3100>;
+	qcom,fg-cc-cv-threshold-mv = <4450>;
+	qcom,fg-ffc-cc-cv-threshold-mv = <4480>;
 	qcom,ki-coeff-low-chg = <315>;
 	qcom,ki-coeff-med-chg = <183>;
 	qcom,fg-delta-soc-thr = <5>;
 };
 
+/*
+ * Align the sink capabilities / DRP preference with the vendor reference
+ * (7.2.2 senemos): advertise a 9V/3A fixed sink PDO, allow up to 27W and
+ * prefer the sink role, so a C-to-C source charges the tablet instead of the
+ * tablet supplying VBUS to it.  The base DTS only had a 9V VAR PDO and a 10W
+ * budget with no role preference.
+ */
 &pm8150b_typec {
+	/*
+	 * The PM8150B PD PHY is powered from PM8150 LDO2 (3.1V), matching the
+	 * vendor DT (pm8150_l2).  Without it the driver falls back to a dummy
+	 * regulator and never powers the PHY, so PD discovery fails and the
+	 * port stays at the 5V DCP contract.
+	 */
+	vdd-pdphy-supply = <&vreg_l2a_3p1>;
+
 	connector {
+		vbus-supply = <&pm8150b_vbus>;
+
 		sink-pdos = <PDO_FIXED(5000, 3000,
 					 PDO_FIXED_DUAL_ROLE |
 					 PDO_FIXED_USB_COMM |
 					 PDO_FIXED_DATA_SWAP)
-					 PDO_VAR(5000, 9000, 3000)>;
+			     PDO_FIXED(9000, 3000,
+					 PDO_FIXED_DUAL_ROLE |
+					 PDO_FIXED_USB_COMM |
+					 PDO_FIXED_DATA_SWAP)>;
+		op-sink-microwatt = <27000000>;
+		try-power-role = "sink";
 	};
 };

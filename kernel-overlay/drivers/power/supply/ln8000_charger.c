@@ -25,7 +25,6 @@
 #include <linux/mutex.h>
 #include <linux/delay.h>
 #include <linux/of_irq.h>
-#include <linux/of_gpio.h>
 #include <linux/of_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/pm_wakeup.h>
@@ -267,6 +266,10 @@ enum ln8000_adc_hibernate_delay_desc {
 #define LN8000_THERMAL_CLEAR_COLD		20
 #define LN8000_THERMAL_CLEAR_HOT		420
 #define LN8000_THERMAL_LIMIT_HOT		450
+/* Bulk charging ends as the pack approaches the float voltage. */
+#define LN8000_BULK_DONE_UV			4400000
+/* The pump is only allowed again once the pack drops well below full. */
+#define LN8000_PUMP_RESTART_UV			4200000
 #define LN8000_THERMAL_POLL_MS			15000
 
 /**
@@ -338,6 +341,7 @@ struct ln8000_info {
     bool chg_en;                /* charging enavbled */
     bool rcp_en;                /* reverse current protection enabled */
     bool thermal_limited;       /* charge pump stopped due to battery temp */
+    bool full_stopped;          /* charge pump stopped because the pack is full */
     int vbat_ovp_alarm_th;      /* vbat ovp alarm threshold */
     int vin_ovp_alarm_th;       /* vin ovp alarm threshold */
     int iin_ocp_alarm_th;       /* iin ocp alarm threshold */
@@ -1022,6 +1026,8 @@ static int ln8000_get_adc_data(struct ln8000_info *info, unsigned int ch, int *r
     return ret;
 }
 
+static int psy_chg_set_charging_enable(struct ln8000_info *info, int val);
+
 static void psy_chg_get_ti_alarm_status(struct work_struct *work)
 {
     struct ln8000_info *info = container_of(work, struct ln8000_info, charge_work.work);
@@ -1063,7 +1069,61 @@ static void psy_chg_get_ti_alarm_status(struct work_struct *work)
             v_offset / 1000);
     ln_dbg("st:0x%x:0x%x:0x%x:0x%x\n", val[0], val[1], val[2], val[3]);
 
-    if (info->chg_en)
+    /*
+     * nabu: stop the charge pump once the fuel gauge reports the pack
+     * full.  The gauge reaches 100% before the pack is truly full and the
+     * SMB5 can no longer terminate the charge through the pump, so gate on
+     * capacity and only allow the pump again below 98%.
+     */
+    {
+        struct power_supply *batt_psy;
+        union power_supply_propval pval;
+        int cap = -1;
+        bool bulk_done;
+
+        batt_psy = power_supply_get_by_name("qcom-battery");
+        if (batt_psy) {
+            if (!power_supply_get_property(batt_psy,
+                                           POWER_SUPPLY_PROP_CAPACITY,
+                                           &pval))
+                cap = pval.intval;
+            power_supply_put(batt_psy);
+        }
+
+        bulk_done = info->vbat_uV >= LN8000_BULK_DONE_UV;
+
+        /*
+         * nabu: the 2:1 pump is the bulk charger. Once the pack approaches
+         * the float voltage (or the gauge already reports 100%), stand the
+         * pump down and let the SMB5 finish in CV so the charge current
+         * tapers instead of holding full current into the pack. Only allow
+         * the pump again once the pack has dropped well below full.
+         */
+        if (!info->full_stopped && info->chg_en &&
+            (bulk_done || cap >= 100)) {
+            psy_chg_set_charging_enable(info, false);
+            info->full_stopped = true;
+            ln_info("pump off for CV top-off (vbat %dmV, cap %d%%)\n",
+                    info->vbat_uV / 1000, cap);
+        } else if (info->full_stopped &&
+                   info->vbat_uV < LN8000_PUMP_RESTART_UV) {
+            info->full_stopped = false;
+            ln_info("vbat %dmV, charge pump allowed again\n",
+                    info->vbat_uV / 1000);
+        }
+    }
+
+    /*
+     * nabu: while USB stays present keep polling.  If the pump is idle
+     * because VBUS was too low for a 2:1 charge pump, pick it back up as soon
+     * as the SMB5 has raised the adapter to 9 V.
+     */
+    if (!info->chg_en && info->usb_present && !info->thermal_limited &&
+        !info->full_stopped &&
+        info->vbus_uV >= info->vbat_uV * 2 + 200000)
+        psy_chg_set_charging_enable(info, true);
+
+    if (info->usb_present)
         schedule_delayed_work(&info->charge_work, msecs_to_jiffies(1000));
 
     return;
@@ -1104,6 +1164,26 @@ static int psy_chg_set_charging_enable(struct ln8000_info *info, int val)
     int op_mode;
 
     if (val) {
+        /*
+         * nabu: the LN8000 is a 2:1 charge pump, so it can only source
+         * current when VBUS is above roughly 2 * VBAT.  At 5 V it trips the
+         * reverse-current protection immediately, and its retry loop also
+         * disturbs the SMB5 APSD/QC classification so the port never leaves
+         * the 5 V/SDP state.  Keep the pump off until the adapter has been
+         * raised to 9 V; psy_chg_get_ti_alarm_status() retries periodically.
+         */
+        ln8000_get_adc_data(info, LN8000_ADC_CH_VIN, &info->vbus_uV);
+        ln8000_get_adc_data(info, LN8000_ADC_CH_VBAT, &info->vbat_uV);
+        if (info->vbus_uV < info->vbat_uV * 2 + 200000) {
+            ln_info("vbus %dmV too low for the 2:1 pump (vbat %dmV), staying off\n",
+                    info->vbus_uV / 1000, info->vbat_uV / 1000);
+            info->chg_en = 0;
+            if (!delayed_work_pending(&info->charge_work))
+                schedule_delayed_work(&info->charge_work,
+                                      msecs_to_jiffies(500));
+            return 0;
+        }
+
         ln_info("start charging\n");
         op_mode = LN8000_OPMODE_SWITCHING;
     } else {
@@ -1158,9 +1238,11 @@ static void ln8000_thermal_work(struct work_struct *work)
         }
     } else if (temp > LN8000_THERMAL_CLEAR_COLD &&
                temp < LN8000_THERMAL_CLEAR_HOT) {
-        ln_info("thermal: battery %d (0.1C), resuming charge pump\n", temp);
         info->thermal_limited = false;
-        psy_chg_set_charging_enable(info, true);
+        if (!info->full_stopped) {
+            ln_info("thermal: battery %d (0.1C), resuming charge pump\n", temp);
+            psy_chg_set_charging_enable(info, true);
+        }
     }
 
 resched:
@@ -1548,7 +1630,7 @@ static int ln8000_parse_dt(struct ln8000_info *info)
 static int ln8000_psy_register(struct ln8000_info *info)
 {
     info->psy_cfg.drv_data = info;
-    info->psy_cfg.of_node  = info->client->dev.of_node;
+    info->psy_cfg.fwnode   = dev_fwnode(&info->client->dev);
     info->psy_desc.name 		= "ln8000-charger";
     info->psy_desc.type 		= POWER_SUPPLY_TYPE_MAINS;
     info->psy_desc.properties	= ln8000_charger_props;
@@ -1592,13 +1674,14 @@ static int ln8000_notifier_call(struct notifier_block *nb,
 
         if (chip->usb_present) {
             msleep(100);
-            if (!chip->thermal_limited)
+            if (!chip->thermal_limited && !chip->full_stopped)
                 psy_chg_set_charging_enable(chip, true);
             schedule_delayed_work(&chip->charge_work, msecs_to_jiffies(0));
             schedule_delayed_work(&chip->thermal_work, msecs_to_jiffies(0));
         }
         else {
             psy_chg_set_charging_enable(chip, false);
+            chip->full_stopped = false;
             //cancel_delayed_work(&chip->charge_work);
         }
 	}
@@ -1683,8 +1766,7 @@ static int ln8000_probe(struct i2c_client *client)
 
     determine_initial_status(info);
 
-    info->typec_psy = power_supply_get_by_phandle(info->dev->of_node,
-							"usb-tcpm");
+    info->typec_psy = devm_power_supply_get_by_reference(info->dev, "usb-tcpm");
 	if (IS_ERR(info->typec_psy)) {
 		ret = PTR_ERR(info->typec_psy);
 		dev_warn(info->dev, "Failed to get USB Type-C: %d\n", ret);
@@ -1741,8 +1823,11 @@ static void ln8000_remove(struct i2c_client *client)
 {
     struct ln8000_info *info = i2c_get_clientdata(client);
 
-    if (info->typec_psy)
+    if (info->typec_psy) {
         cancel_delayed_work_sync(&info->thermal_work);
+        cancel_delayed_work_sync(&info->charge_work);
+        cancel_delayed_work_sync(&info->status_changed_work);
+    }
     ln8000_change_opmode(info, LN8000_OPMODE_STANDBY);
 
     if (client->irq) {
