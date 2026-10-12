@@ -7,6 +7,7 @@
 #include <linux/kernel.h>
 #include <linux/math64.h>
 #include <linux/module.h>
+#include <linux/slab.h>
 #include <linux/of_address.h>
 #include <linux/of_device.h>
 #include <linux/of_irq.h>
@@ -1575,6 +1576,34 @@ static int qcom_fg_gen4_load_profile(struct qcom_fg_chip *chip)
 			"missing or invalid qcom,fg-profile-data (len=%d, want %d)\n",
 			plen, PROFILE_LEN);
 		return -EINVAL;
+	}
+
+	/*
+	 * The gauge keeps running in the PMIC across reboots. Like the vendor
+	 * fg-gen4 driver, only (re)load the profile when the gauge doesn't
+	 * already hold this one: reloading restarts the gauge, which throws
+	 * away its learned state and re-estimates the SOC from the voltage at
+	 * boot (under load), so the percentage jumped after every reboot
+	 * (e.g. 73 % -> 54 %).
+	 */
+	{
+		u8 integrity = 0, *cur;
+		bool same = false;
+
+		cur = kmalloc(PROFILE_LEN, GFP_KERNEL);
+		if (cur &&
+		    !qcom_fg_gen4_sram_read(chip, PROFILE_INTEGRITY_WORD,
+					    PROFILE_INTEGRITY_OFFSET, &integrity, 1) &&
+		    (integrity & PROFILE_LOAD_BIT) &&
+		    !qcom_fg_gen4_sram_read(chip, PROFILE_LOAD_WORD,
+					    PROFILE_LOAD_OFFSET, cur, PROFILE_LEN))
+			same = !memcmp(cur, profile, PROFILE_LEN);
+		kfree(cur);
+		if (same) {
+			dev_info(chip->dev,
+				 "battery profile already loaded, keeping gauge state\n");
+			return 0;
+		}
 	}
 
 	/* Quiesce the gauge algorithm while the profile is replaced. */
