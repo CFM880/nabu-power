@@ -269,6 +269,34 @@ enum ln8000_adc_hibernate_delay_desc {
 #define LN8000_THERMAL_LIMIT_HOT		450
 #define LN8000_THERMAL_POLL_MS			15000
 
+/*
+ * Hand the battery back to the PM8150B switching charger near full. The pump
+ * has no taper or termination of its own (its VFLOAT loop is disabled in the
+ * nabu DT), so stop it here and let the main charger finish at its float
+ * voltage and terminate.
+ */
+#define LN8000_HANDOFF_VBAT_UV			4400000
+/*
+ * The 2:1 pump can't lift VBAT above ~VBUS/2: with a QC adapter sagging to
+ * ~8.7V under load it stalls around 4.35V with the battery current tapering
+ * to zero long before LN8000_HANDOFF_VBAT_UV. Hand over once the *battery*
+ * charge current (fuel gauge) has stayed below LN8000_TAPER_IBAT_UA for
+ * LN8000_TAPER_POLLS consecutive 1 s polls near full. The pump's own input
+ * current is no use here: while USBIN is suspended the pump also carries the
+ * whole system load.
+ */
+#define LN8000_TAPER_IBAT_UA			500000
+#define LN8000_TAPER_MIN_VBAT_UV		4250000
+#define LN8000_TAPER_POLLS			10
+#define LN8000_BATTERY_NAME			"qcom-battery"
+/* Stop if the pump was asked to switch but the IC isn't, for this many polls */
+#define LN8000_NOT_SWITCHING_MAX		3
+#define LN8000_MAIN_CHARGER_NAME		"pm8150b-charger"
+/* 2:1 switching needs the QC adapter at 9V; wait for it after plug-in */
+#define LN8000_START_MIN_VBUS_UV		7500000
+#define LN8000_START_TRIES			15
+#define LN8000_START_POLL_MS			1000
+
 /**
  * driver instance structure definition
  */
@@ -307,6 +335,8 @@ struct ln8000_info {
     struct delayed_work status_changed_work;
     struct delayed_work charge_work;
     struct delayed_work thermal_work;
+    struct delayed_work start_work;
+    int start_tries;
     int status;
 
     struct mutex data_lock;
@@ -338,6 +368,10 @@ struct ln8000_info {
     bool chg_en;                /* charging enavbled */
     bool rcp_en;                /* reverse current protection enabled */
     bool thermal_limited;       /* charge pump stopped due to battery temp */
+    bool main_chg_suspended;    /* we suspended the main charger's USB input */
+    bool handed_off;            /* near full: main charger finishes, until unplug */
+    int not_switching;          /* polls with chg_en set but IC not switching */
+    int taper_polls;            /* consecutive polls with iin below the taper level */
     int vbat_ovp_alarm_th;      /* vbat ovp alarm threshold */
     int vin_ovp_alarm_th;       /* vin ovp alarm threshold */
     int iin_ocp_alarm_th;       /* iin ocp alarm threshold */
@@ -368,7 +402,7 @@ do {                                    \
 
 #define ln_dbg(fmt, ...)                \
 do {                                    \
-        printk(KERN_DEBUG "ln8000@pri: %s: " fmt, __func__, ##__VA_ARGS__); \
+        pr_debug("ln8000@pri: %s: " fmt, __func__, ##__VA_ARGS__); \
 } while (0);
 
 #define LN8000_REG_PRINT(reg_addr, val)                         \
@@ -850,6 +884,43 @@ static void ln8000_irq_sleep(struct ln8000_info *info, int suspend)
     }
 }
 
+/*
+ * The pump and the PM8150B switching charger must not both draw from VBUS:
+ * suspend the main charger's USB input while the pump switches and resume it
+ * whenever the pump stops, so the main charger takes over (and re-runs its
+ * input current detection) instead of leaving the device on battery.
+ */
+static void __ln8000_set_main_charger(struct ln8000_info *info, bool enable,
+                                      bool force)
+{
+    union power_supply_propval val = { .intval = enable };
+    struct power_supply *psy;
+    int ret;
+
+    if (enable && !info->main_chg_suspended && !force)
+        return;
+
+    psy = power_supply_get_by_name(LN8000_MAIN_CHARGER_NAME);
+    if (!psy) {
+        ln_err("%s not found, can't %s it\n", LN8000_MAIN_CHARGER_NAME,
+               enable ? "resume" : "suspend");
+        return;
+    }
+    ret = power_supply_set_property(psy, POWER_SUPPLY_PROP_STATUS, &val);
+    power_supply_put(psy);
+    if (ret) {
+        ln_err("failed to %s main charger (%d)\n",
+               enable ? "resume" : "suspend", ret);
+        return;
+    }
+    info->main_chg_suspended = !enable;
+}
+
+static void ln8000_set_main_charger(struct ln8000_info *info, bool enable)
+{
+    __ln8000_set_main_charger(info, enable, false);
+}
+
 static void ln8000_update_opmode(struct ln8000_info *info)
 {
     unsigned int op_mode;
@@ -876,6 +947,7 @@ static void ln8000_update_opmode(struct ln8000_info *info)
             ln8000_update_reg(info, LN8000_REG_SYS_CTRL, 1 << LN8000_BIT_STANDBY_EN, 1 << LN8000_BIT_STANDBY_EN);
             ln_info("forced trigger standby_en\n");
 		info->chg_en = 0;
+		ln8000_set_main_charger(info, true);
         }
         ln_info("op_mode has been changed [%d]->[%d] (sys_st=0x%x)\n", info->op_mode, op_mode, val);
         info->op_mode = op_mode;
@@ -1022,10 +1094,30 @@ static int ln8000_get_adc_data(struct ln8000_info *info, unsigned int ch, int *r
     return ret;
 }
 
+static int psy_chg_set_charging_enable(struct ln8000_info *info, int val);
+
+/* Battery current from the fuel gauge (positive = charging); false if unknown */
+static bool ln8000_battery_current(int *ua)
+{
+    union power_supply_propval val = { 0 };
+    struct power_supply *psy;
+    int ret;
+
+    psy = power_supply_get_by_name(LN8000_BATTERY_NAME);
+    if (!psy)
+        return false;
+    ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_CURRENT_NOW, &val);
+    power_supply_put(psy);
+    if (ret < 0)
+        return false;
+    *ua = val.intval;
+    return true;
+}
+
 static void psy_chg_get_ti_alarm_status(struct work_struct *work)
 {
     struct ln8000_info *info = container_of(work, struct ln8000_info, charge_work.work);
-    int v_offset;
+    int v_offset, ibat = 0;
     bool bus_ovp, bus_ocp, bat_ovp;
     u8 val[4];
 
@@ -1052,7 +1144,38 @@ static void psy_chg_get_ti_alarm_status(struct work_struct *work)
             ln8000_change_opmode(info, LN8000_OPMODE_STANDBY);
             ln_info("forced change standby_mode for prevent reverse current\n");
 		info->chg_en = 0;
+		info->handed_off = true;
+		ln8000_set_main_charger(info, true);
         }
+    }
+
+    if (info->chg_en && info->vbat_uV >= LN8000_TAPER_MIN_VBAT_UV &&
+        ln8000_battery_current(&ibat) && ibat < LN8000_TAPER_IBAT_UA) {
+        if (++info->taper_polls >= LN8000_TAPER_POLLS) {
+            ln_info("battery current tapered to %d mA at vbat %d mV: handing over to the main charger\n",
+                    ibat / 1000, info->vbat_uV / 1000);
+            info->handed_off = true;
+            psy_chg_set_charging_enable(info, false);
+        }
+    } else {
+        info->taper_polls = 0;
+    }
+
+    if (info->chg_en && info->vbat_uV >= LN8000_HANDOFF_VBAT_UV) {
+        ln_info("vbat %d mV: handing over to the main charger\n",
+                info->vbat_uV / 1000);
+        info->handed_off = true;
+        psy_chg_set_charging_enable(info, false);
+    }
+
+    if (info->chg_en && !(info->pwr_status & LN8000_MASK_SWITCHING_ENABLED)) {
+        if (++info->not_switching >= LN8000_NOT_SWITCHING_MAX) {
+            ln_info("not switching (sys_st=0x%x), handing back to the main charger\n",
+                    info->pwr_status);
+            psy_chg_set_charging_enable(info, false);
+        }
+    } else {
+        info->not_switching = 0;
     }
 
     ln8000_bulk_read_reg(info, LN8000_REG_SYS_STS, val, 4);
@@ -1099,29 +1222,64 @@ static int ln8000_charger_get_property(struct power_supply *psy,
     return 0;
 }
 
+#define LN8000_START_ATTEMPTS			5
+
 static int psy_chg_set_charging_enable(struct ln8000_info *info, int val)
 {
-    int op_mode;
-
-    if (val) {
-        ln_info("start charging\n");
-        op_mode = LN8000_OPMODE_SWITCHING;
-    } else {
-        ln_info("stop charging\n");
-        op_mode = LN8000_OPMODE_STANDBY;
-    }
+    u32 sys_st = 0;
+    int i;
 
     /* when the start-up to charging, we need to disabled rcp. */
     ln8000_enable_rcp(info, 0);
 
-    ln8000_change_opmode(info, op_mode);
-    msleep(10);
-    ln8000_update_opmode(info);
+    if (!val) {
+        ln_info("stop charging\n");
+        ln8000_change_opmode(info, LN8000_OPMODE_STANDBY);
+        msleep(10);
+        ln8000_update_opmode(info);
+        info->chg_en = 0;
+        ln8000_set_main_charger(info, true);
+        ln_info("op_mode=%d\n", info->op_mode);
+        return 0;
+    }
+
+    ln_info("start charging\n");
+    info->not_switching = 0;
+    info->taper_polls = 0;
+    ln8000_set_main_charger(info, false);
+
+    /*
+     * The IC usually drops back to standby right after the first switching
+     * request (sys_st=0x2) and only switches on a later one, so retry here
+     * instead of treating the first standby as the pump stopping.
+     */
+    for (i = 0; i < LN8000_START_ATTEMPTS; i++) {
+        if (i) {
+            ln8000_update_reg(info, LN8000_REG_SYS_CTRL,
+                              1 << LN8000_BIT_STANDBY_EN,
+                              1 << LN8000_BIT_STANDBY_EN);
+            msleep(20);
+        }
+        ln8000_change_opmode(info, LN8000_OPMODE_SWITCHING);
+        msleep(100);
+        ln8000_read_reg(info, LN8000_REG_SYS_STS, &sys_st);
+        if (sys_st & LN8000_MASK_SWITCHING_ENABLED)
+            break;
+    }
 
     ln8000_print_regmap(info);
-    info->chg_en = val;
 
-    ln_info("op_mode=%d\n", info->op_mode);
+    if (!(sys_st & LN8000_MASK_SWITCHING_ENABLED)) {
+        ln_info("not switching after %d attempts (sys_st=0x%x)\n", i, sys_st);
+        ln8000_change_opmode(info, LN8000_OPMODE_STANDBY);
+        info->chg_en = 0;
+        ln8000_set_main_charger(info, true);
+        return -EIO;
+    }
+
+    info->op_mode = LN8000_OPMODE_SWITCHING;
+    info->chg_en = 1;
+    ln_info("switching after %d attempt(s)\n", i + 1);
 
     return 0;
 }
@@ -1158,9 +1316,12 @@ static void ln8000_thermal_work(struct work_struct *work)
         }
     } else if (temp > LN8000_THERMAL_CLEAR_COLD &&
                temp < LN8000_THERMAL_CLEAR_HOT) {
-        ln_info("thermal: battery %d (0.1C), resuming charge pump\n", temp);
         info->thermal_limited = false;
-        psy_chg_set_charging_enable(info, true);
+        if (!info->handed_off) {
+            ln_info("thermal: battery %d (0.1C), resuming charge pump\n", temp);
+            info->start_tries = 0;
+            mod_delayed_work(system_wq, &info->start_work, 0);
+        }
     }
 
 resched:
@@ -1575,6 +1736,47 @@ static void ln8000_status_changed_worker(struct work_struct *work)
 	power_supply_changed(chip->psy_chg);
 }
 
+/*
+ * Start the pump only once the adapter has been raised to 9V (the main charger
+ * requests it after APSD, ~2s after plug-in). Starting at 5V makes the IC fall
+ * straight back to standby, and nothing retried it.
+ */
+static void ln8000_start_work(struct work_struct *work)
+{
+    struct ln8000_info *info = container_of(work, struct ln8000_info,
+                                            start_work.work);
+    union power_supply_propval val = { 0 };
+    struct power_supply *psy;
+    int ret = -ENODEV;
+
+    if (!info->usb_present || info->thermal_limited || info->handed_off ||
+        info->chg_en)
+        return;
+
+    psy = power_supply_get_by_name(LN8000_MAIN_CHARGER_NAME);
+    if (psy) {
+        ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_VOLTAGE_NOW, &val);
+        power_supply_put(psy);
+    }
+
+    if (ret >= 0 && val.intval >= LN8000_START_MIN_VBUS_UV) {
+        ln_info("vbus %d mV, starting charge pump\n", val.intval / 1000);
+        psy_chg_set_charging_enable(info, true);
+        schedule_delayed_work(&info->charge_work, msecs_to_jiffies(0));
+        return;
+    }
+
+    if (++info->start_tries < LN8000_START_TRIES) {
+        schedule_delayed_work(&info->start_work,
+                              msecs_to_jiffies(LN8000_START_POLL_MS));
+        return;
+    }
+    ln_info("vbus stays at %d mV, leaving charging to the main charger\n",
+            ret < 0 ? ret : val.intval / 1000);
+    /* the adapter may still be at 9V, where the main charger draws nothing */
+    __ln8000_set_main_charger(info, true, true);
+}
+
 static int ln8000_notifier_call(struct notifier_block *nb,
 		unsigned long val, void *v)
 {
@@ -1591,13 +1793,16 @@ static int ln8000_notifier_call(struct notifier_block *nb,
 		power_supply_changed(chip->psy_chg);
 
         if (chip->usb_present) {
-            msleep(100);
-            if (!chip->thermal_limited)
-                psy_chg_set_charging_enable(chip, true);
-            schedule_delayed_work(&chip->charge_work, msecs_to_jiffies(0));
+            if (!chip->chg_en && !delayed_work_pending(&chip->start_work)) {
+                chip->start_tries = 0;
+                schedule_delayed_work(&chip->start_work,
+                                      msecs_to_jiffies(LN8000_START_POLL_MS));
+            }
             schedule_delayed_work(&chip->thermal_work, msecs_to_jiffies(0));
         }
         else {
+            cancel_delayed_work(&chip->start_work);
+            chip->handed_off = false;
             psy_chg_set_charging_enable(chip, false);
             //cancel_delayed_work(&chip->charge_work);
         }
@@ -1628,7 +1833,6 @@ static int ln8000_probe(struct i2c_client *client)
     info->pdata = devm_kzalloc(&client->dev, sizeof(struct ln8000_platform_data), GFP_KERNEL);
     if (info->pdata == NULL) {
        ln_err("fail to alloc devm for ln8000_platform_data\n");
-       kfree(info);
        return -ENOMEM;
     }
     info->dev = &client->dev;
@@ -1696,6 +1900,7 @@ static int ln8000_probe(struct i2c_client *client)
 			ln8000_status_changed_worker);
         INIT_DELAYED_WORK(&info->charge_work, psy_chg_get_ti_alarm_status);
         INIT_DELAYED_WORK(&info->thermal_work, ln8000_thermal_work);
+        INIT_DELAYED_WORK(&info->start_work, ln8000_start_work);
 
 		info->nb.notifier_call = ln8000_notifier_call;
 		ret = power_supply_reg_notifier(&info->nb);
@@ -1706,34 +1911,29 @@ static int ln8000_probe(struct i2c_client *client)
 		}
 
         if (info->volt_qual) {
-            ln_info("start charging on init\n");
-            psy_chg_set_charging_enable(info, true);
-            schedule_delayed_work(&info->charge_work, msecs_to_jiffies(0));
+            /* adapter already attached at boot: same path as a plug-in */
+            ln_info("adapter present on init\n");
+            info->usb_present = true;
+            info->start_tries = 0;
+            schedule_delayed_work(&info->start_work,
+                                  msecs_to_jiffies(LN8000_START_POLL_MS));
             schedule_delayed_work(&info->thermal_work, msecs_to_jiffies(0));
         }
 	}
 
     return 0;
 
+    /* the IRQ, power supply, regmap and both allocations are devm-managed */
 err_wakeup:
-    if (client->irq) {
-       free_irq(client->irq, info);
-       if (info->pdata->irq_gpio) {
-           gpiod_put(info->pdata->irq_gpio);
-       }
-    }
 err_psy:
-    power_supply_unregister(info->psy_chg);
-
+    if (info->pdata->irq_gpio)
+        gpiod_put(info->pdata->irq_gpio);
 err_cleanup:
     i2c_set_clientdata(client, NULL);
     mutex_destroy(&info->data_lock);
     mutex_destroy(&info->i2c_lock);
     mutex_destroy(&info->irq_lock);
 err_devmem:
-    kfree(info->pdata);
-    kfree(info);
-
     return ret;
 }
 
@@ -1741,28 +1941,34 @@ static void ln8000_remove(struct i2c_client *client)
 {
     struct ln8000_info *info = i2c_get_clientdata(client);
 
-    if (info->typec_psy)
+    /*
+     * The IRQ, the power supply, the regmap and the info/pdata allocations
+     * are devm-managed: freeing them here as well crashed rmmod
+     * (free_irq warning, double power_supply_unregister, double kfree).
+     */
+    /* these work items only exist with a Type-C supply / an IRQ (see probe) */
+    if (info->typec_psy) {
+        power_supply_unreg_notifier(&info->nb);
+        cancel_delayed_work_sync(&info->start_work);
         cancel_delayed_work_sync(&info->thermal_work);
-    ln8000_change_opmode(info, LN8000_OPMODE_STANDBY);
-
-    if (client->irq) {
-       free_irq(client->irq, info);
-       if (info->pdata->irq_gpio) {
-           gpiod_put(info->pdata->irq_gpio);
-       }
+        cancel_delayed_work_sync(&info->charge_work);
+        cancel_delayed_work_sync(&info->status_changed_work);
     }
+    if (client->irq)
+        cancel_delayed_work_sync(&info->vac_ov_work);
 
-    power_supply_unregister(info->psy_chg);
-    i2c_set_clientdata(info->client, NULL);
+    ln8000_change_opmode(info, LN8000_OPMODE_STANDBY);
+    ln8000_set_main_charger(info, true);
+
+    if (info->pdata->irq_gpio)
+        gpiod_put(info->pdata->irq_gpio);
+
+    if (info->typec_psy)
+        power_supply_put(info->typec_psy);  /* ref from power_supply_get_by_phandle() */
 
     mutex_destroy(&info->data_lock);
     mutex_destroy(&info->i2c_lock);
     mutex_destroy(&info->irq_lock);
-
-    kfree(info->pdata);
-    kfree(info);
-
-    return;
 }
 
 static void ln8000_shutdown(struct i2c_client *client)
