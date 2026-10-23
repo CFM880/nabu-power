@@ -166,13 +166,22 @@
 };
 
 /*
- * The port keeps the base tree's dr_mode = "otg" + usb-role-switch, so the
- * PM8150B TCPM drives the data role dynamically: attach a host and dwc3
- * becomes a device (the nabu-serial CDC-ACM console enumerates), attach an OTG
- * device and it becomes a host.
+ * Pin the Type-C port to device role.
  *
- * This only works because the charger no longer owns the HS PHY: the old
- * dpdm-supply made the PMIC hand D+/D- over for APSD/QC detection, which left
- * dwc3 blind and pinned the port in host role - that is why the port used to
- * be hardcoded to "peripheral" here.
+ * Dynamic role switching (the base tree's dr_mode = "otg" + usb-role-switch)
+ * does not work here: the PM8150B TCPM never reports a CC attach on this port
+ * (dmesg only shows "isr: tx_sig"), so it stays in its default source/host
+ * role even with a charger plugged in:
+ *
+ *   data_role = host [device]   power_role = source [sink]
+ *
+ * Host mode would be useless anyway: it needs 5V out, and mainline's
+ * qcom-pmi8998 driver does not expose the SMB5 OTG boost.  Device role is the
+ * only useful one - charger and PC - and pinning it keeps the state clean.
+ *
+ * The keyboard cover is unaffected: it uses usb_2, which the base tree pins to
+ * host (dr_mode = "host").
  */
+&usb_1_dwc3 {
+	dr_mode = "peripheral";
+};
