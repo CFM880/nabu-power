@@ -166,16 +166,13 @@
 };
 
 /*
- * The charging stack owns the Type-C role switch, and the charger's
- * dpdm-supply makes the HS PHY hand D+/D- over to the PMIC for APSD/QC
- * detection.  With dr_mode = "otg" the port then stays in host role (or flips
- * role while enumerating), so the nabu-serial CDC-ACM gadget never appears and
- * the kernel console is lost.
+ * The port keeps the base tree's dr_mode = "otg" + usb-role-switch, so the
+ * PM8150B TCPM drives the data role dynamically: attach a host and dwc3
+ * becomes a device (the nabu-serial CDC-ACM console enumerates), attach an OTG
+ * device and it becomes a host.
  *
- * Pin the port to device role so the console survives: charging does not
- * depend on the data role (SMB5/LN8000 drive VBUS and the battery directly),
- * the only loss is OTG host support on this port.
+ * This only works because the charger no longer owns the HS PHY: the old
+ * dpdm-supply made the PMIC hand D+/D- over for APSD/QC detection, which left
+ * dwc3 blind and pinned the port in host role - that is why the port used to
+ * be hardcoded to "peripheral" here.
  */
-&usb_1_dwc3 {
-	dr_mode = "peripheral";
-};
