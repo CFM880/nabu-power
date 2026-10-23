@@ -34,8 +34,12 @@
 				      <&pm8150b_adc ADC5_USB_IN_V_16>;
 			io-channel-names = "usbin_i", "usbin_v";
 
-			/* Let the USB HS PHY release D+/D- for APSD/QC. */
-			dpdm-supply = <&usb_1_hsphy>;
+			/*
+			 * No dpdm-supply: handing D+/D- to the PMIC for APSD/QC
+			 * leaves dwc3 without them, so the UDC never attaches and
+			 * the nabu-serial console never enumerates.  We lose fast
+			 * charger detection, the 5V path still charges.
+			 */
 
 			monitored-battery = <&battery>;
 			status = "okay";
