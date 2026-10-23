@@ -55,6 +55,14 @@
 		qcom,pre-scaling = <1 16>;
 		label = "usbin_v";
 	};
+
+	/* Battery voltage: the only way to get a state of charge on this tablet,
+	 * since the PM8150B has no fuel gauge and the base DTS ships no OCV table. */
+	channel@84 {
+		reg = <ADC5_VBAT_SNS>;
+		qcom,pre-scaling = <1 3>;
+		label = "vbat";
+	};
 };
 
 &i2c4 {
@@ -67,6 +75,10 @@
 		irq-gpios = <&tlmm 36 0x2002>;
 
 		usb-tcpm = <&pm8150b_typec>;
+
+		/* Battery voltage for the capacity estimate (see channel@9 above). */
+		io-channels = <&pm8150b_adc ADC5_VBAT_SNS>;
+		io-channel-names = "vbat";
 
 		ln8000_charger,bat-ovp-threshold = <4560>;
 		ln8000_charger,bat-ovp-alarm-threshold = <4525>;
@@ -147,4 +159,19 @@
 					 PDO_FIXED_DATA_SWAP)
 					 PDO_VAR(5000, 9000, 3000)>;
 	};
+};
+
+/*
+ * The charging stack owns the Type-C role switch, and the charger's
+ * dpdm-supply makes the HS PHY hand D+/D- over to the PMIC for APSD/QC
+ * detection.  With dr_mode = "otg" the port then stays in host role (or flips
+ * role while enumerating), so the nabu-serial CDC-ACM gadget never appears and
+ * the kernel console is lost.
+ *
+ * Pin the port to device role so the console survives: charging does not
+ * depend on the data role (SMB5/LN8000 drive VBUS and the battery directly),
+ * the only loss is OTG host support on this port.
+ */
+&usb_1_dwc3 {
+	dr_mode = "peripheral";
 };

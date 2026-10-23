@@ -1564,6 +1564,14 @@ static int ln8000_psy_register(struct ln8000_info *info)
 
     ln_info("successfully registered power supply\n");
 
+    /*
+     * Nabu: no extra battery supply here.  The kernel already ships a real
+     * fuel gauge (drivers/power/supply/qcom-fg -> "qcom-battery", fed by the
+     * PM8150B FG-gen4 block) and a charger (qcom-pmi8998 -> "pm8150b-charger").
+     * A second BATTERY supply only confuses upower: it picks the lower
+     * percentage and reports "discharging" while the tablet charges.
+     */
+
     return 0;
 }
 
