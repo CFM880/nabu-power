@@ -21,6 +21,7 @@
 #include <linux/power_supply.h>
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
+#include <linux/regulator/driver.h>
 #include <linux/types.h>
 #include <linux/workqueue.h>
 
@@ -453,6 +454,8 @@ struct smb2_chip {
 
 	struct power_supply *chg_psy;
 	struct regulator *dpdm_reg;
+	/* Nabu: SMB5 5V boost for the Type-C port in host mode. */
+	struct regulator_dev *otg_rdev;
 
 	/* Per-PMIC register scaling. SMB2 uses 25mA/7.5mV steps, SMB5 (PM8150B)
 	 * uses 50mA/10mV steps and is configured by the Type-C driver instead. */
@@ -1403,6 +1406,72 @@ static int smb2_init_irq(struct smb2_chip *chip, int *irq, const char *name,
 	return 0;
 }
 
+/*
+ * Nabu: SMB5 OTG boost, i.e. 5V out on the Type-C port so it can act as a USB
+ * host (sticks, headsets, keyboards).  Only the DCDC bits are touched:
+ *
+ *   0x153 OTG_EN_SRC_CFG = BIT(1)  - OTG enable follows the command bit
+ *   0x140 OTG_EN         = BIT(0)  - boost on/off
+ *
+ * The current limit keeps its reset value.  Offsets are relative to CHGR_BASE,
+ * so 0x1140 / 0x1153 on PM8150B.
+ */
+#define SMB5_DCDC_CMD_OTG	0x140
+#define SMB5_DCDC_OTG_CFG	0x153
+#define SMB5_OTG_EN		BIT(0)
+#define SMB5_OTG_EN_SRC_CMD	BIT(1)
+
+
+static int smb2_otg_enable(struct regulator_dev *rdev)
+{
+	struct smb2_chip *chip = rdev_get_drvdata(rdev);
+	int rc;
+
+	rc = regmap_update_bits(chip->regmap, chip->base + SMB5_DCDC_OTG_CFG,
+				SMB5_OTG_EN_SRC_CMD, SMB5_OTG_EN_SRC_CMD);
+	if (rc)
+		return rc;
+
+	return regmap_update_bits(chip->regmap, chip->base + SMB5_DCDC_CMD_OTG,
+				  SMB5_OTG_EN, SMB5_OTG_EN);
+}
+
+static int smb2_otg_disable(struct regulator_dev *rdev)
+{
+	struct smb2_chip *chip = rdev_get_drvdata(rdev);
+
+	return regmap_update_bits(chip->regmap, chip->base + SMB5_DCDC_CMD_OTG,
+				  SMB5_OTG_EN, 0);
+}
+
+static int smb2_otg_is_enabled(struct regulator_dev *rdev)
+{
+	struct smb2_chip *chip = rdev_get_drvdata(rdev);
+	unsigned int val;
+	int rc;
+
+	rc = regmap_read(chip->regmap, chip->base + SMB5_DCDC_CMD_OTG, &val);
+	if (rc)
+		return rc;
+
+	return !!(val & SMB5_OTG_EN);
+}
+
+static const struct regulator_ops smb2_otg_ops = {
+	.enable     = smb2_otg_enable,
+	.disable    = smb2_otg_disable,
+	.is_enabled = smb2_otg_is_enabled,
+};
+
+static const struct regulator_desc smb2_otg_desc = {
+	.name		= "usb-otg-vbus",
+	.type		= REGULATOR_VOLTAGE,
+	.owner		= THIS_MODULE,
+	.ops		= &smb2_otg_ops,
+	.fixed_uV	= 5000000,
+	.n_voltages	= 1,
+};
+
 static int smb2_probe(struct platform_device *pdev)
 {
 	struct power_supply_config supply_config = {};
@@ -1521,6 +1590,43 @@ static int smb2_probe(struct platform_device *pdev)
 	rc = smb2_init_irq(chip, &irq, "wdog-bark", smb2_handle_wdog_bark);
 	if (rc < 0)
 		return rc;
+
+	if (data->is_smb5) {
+		struct regulator_config cfg = {
+			.dev			= chip->dev,
+			.driver_data		= chip,
+			.of_node		= chip->dev->of_node,
+		};
+
+		chip->otg_rdev = devm_regulator_register(chip->dev,
+							 &smb2_otg_desc, &cfg);
+		if (IS_ERR(chip->otg_rdev))
+			return dev_err_probe(chip->dev,
+					     PTR_ERR(chip->otg_rdev),
+					     "failed to register OTG regulator\n");
+
+		/*
+		 * "nabu,otg-force-on" keeps the 5V boost up from probe, which is
+		 * the only way to test the host path while the TCPM on this port
+		 * cannot report a CC attach (see nabu-power's dtsi).
+		 */
+		if (of_property_read_bool(chip->dev->of_node, "nabu,otg-force-on")) {
+			struct regulator *vbus;
+
+			vbus = devm_regulator_get(chip->dev, "usb-otg-vbus");
+			if (IS_ERR(vbus)) {
+				dev_warn(chip->dev, "no usb-otg-vbus handle: %ld\n",
+					 PTR_ERR(vbus));
+			} else {
+				rc = regulator_enable(vbus);
+				if (rc)
+					dev_warn(chip->dev,
+						 "OTG force enable failed: %d\n", rc);
+				else
+					dev_info(chip->dev, "OTG boost forced on\n");
+			}
+		}
+	}
 
 	rc = dev_pm_set_wake_irq(chip->dev, chip->cable_irq);
 	if (rc < 0)
