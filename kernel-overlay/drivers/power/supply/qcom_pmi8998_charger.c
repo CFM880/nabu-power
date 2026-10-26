@@ -269,6 +269,7 @@
 
 #define USBIN_ADAPTER_ALLOW_CFG				0x360
 #define USBIN_ADAPTER_ALLOW_5V_OR_9V			3
+#define USBIN_ADAPTER_ALLOW_5V_TO_9V			8
 #define USBIN_ADAPTER_ALLOW_5V_TO_12V			12
 
 #define CMD_HVDCP_2					0x343
@@ -439,6 +440,8 @@ struct smb2_register {
  * @chg_psy:		Charger power supply instance
  */
 struct smb2_chip {
+	/* USBIN suspended by the charge pump (LN8000) while it charges */
+	bool input_suspended;
 	struct device *dev;
 	const char *name;
 	unsigned int base;
@@ -514,6 +517,13 @@ static int smb2_get_prop_usb_online(struct smb2_chip *chip, int *val)
 
 	*val = (stat & P_PATH_USE_USBIN_BIT) &&
 	       (stat & P_PATH_VALID_INPUT_POWER_SOURCE_STS_BIT);
+	/*
+	 * While the charge pump runs it has suspended USBIN, so the power path
+	 * no longer shows USBIN in use, but the adapter is still there (the
+	 * pump resumes USBIN as soon as it is unplugged).
+	 */
+	if (chip->input_suspended)
+		*val = 1;
 	return 0;
 }
 
@@ -571,6 +581,12 @@ static int smb2_get_prop_status(struct smb2_chip *chip, int *val)
 	if (!usb_online) {
 		*val = POWER_SUPPLY_STATUS_DISCHARGING;
 		return rc;
+	}
+
+	/* The charge pump only suspends USBIN while it is charging the battery */
+	if (chip->input_suspended) {
+		*val = POWER_SUPPLY_STATUS_CHARGING;
+		return 0;
 	}
 
 	/*
@@ -863,9 +879,9 @@ static void smb2_jeita_work(struct work_struct *work)
 					       &val))
 			cur = val.intval;
 
-		if (cap >= 100 && cur < 400000)
+		if (cap >= 100 && cur < 400000 && cur > -200000)
 			full = true;
-		else if (cap <= 98 || cur >= 500000)
+		else if (cap <= 98 || cur >= 500000 || cur <= -200000)
 			full = false;
 
 		if (full != chip->charge_full) {
@@ -987,6 +1003,32 @@ static int smb2_get_property(struct power_supply *psy,
 	}
 }
 
+/*
+ * Suspend or resume the USB input. A charge pump (LN8000 on nabu) suspends it
+ * while it charges the battery directly from VBUS and resumes it when it
+ * stops. Leaving the input running under the pump lets AICL collapse to 0 mA,
+ * and nothing restores it afterwards: the device then runs from the battery
+ * with the adapter still attached. Releasing the suspend restarts the input
+ * soft-start and AICL from scratch, the same as a re-plug.
+ */
+static int smb2_set_input_suspend(struct smb2_chip *chip, bool suspend)
+{
+	int rc;
+
+	rc = regmap_update_bits(chip->regmap, chip->base + USBIN_CMD_IL,
+				USBIN_SUSPEND_BIT, suspend ? USBIN_SUSPEND_BIT : 0);
+	if (rc < 0)
+		return rc;
+
+	chip->input_suspended = suspend;
+	dev_info(chip->dev, "USB input %s\n", suspend ? "suspended" : "resumed");
+	if (!suspend)
+		mod_delayed_work(system_wq, &chip->jeita_work, 0);
+	power_supply_changed(chip->chg_psy);
+
+	return 0;
+}
+
 static int smb2_set_property(struct power_supply *psy,
 			     enum power_supply_property psp,
 			     const union power_supply_propval *val)
@@ -996,6 +1038,8 @@ static int smb2_set_property(struct power_supply *psy,
 	switch (psp) {
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
 		return smb2_set_current_limit(chip, val->intval);
+	case POWER_SUPPLY_PROP_STATUS:
+		return smb2_set_input_suspend(chip, !val->intval);
 	default:
 		dev_err(chip->dev, "No setter for property: %d\n", psp);
 		return -EINVAL;
@@ -1007,6 +1051,7 @@ static int smb2_property_is_writable(struct power_supply *psy,
 {
 	switch (psp) {
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
+	case POWER_SUPPLY_PROP_STATUS:
 		return 1;
 	default:
 		return 0;
@@ -1109,6 +1154,11 @@ static const struct smb2_register smb2_init_seq[] = {
 	  .mask = SOC_LT_CHG_RECHARGE_THRESH_SEL_BIT |
 		  VBT_LT_CHG_RECHARGE_THRESH_SEL_BIT,
 	  .val = VBT_LT_CHG_RECHARGE_THRESH_SEL_BIT },
+	/*
+	 * A charge pump may have left the input suspended across a warm
+	 * reboot (PMIC registers survive it); start with it resumed.
+	 */
+	{ .addr = USBIN_CMD_IL, .mask = USBIN_SUSPEND_BIT, .val = 0 },
 	/* Enable charging */
 	{ .addr = USBIN_OPTIONS_1_CFG, .mask = HVDCP_EN_BIT, .val = 0 },
 	{ .addr = CHARGING_ENABLE_CMD,
@@ -1279,11 +1329,18 @@ static int smb2_init_hw(struct smb2_chip *chip)
 			return dev_err_probe(chip->dev, rc,
 					     "failed to enable APSD/HVDCP\n");
 
-		/* Allow the adapter to raise VBUS to 9V (QC2, stable) so the
-		 * LN8000 charge pump can also run. */
+		/*
+		 * Allow the adapter to raise VBUS to 9V (QC2) so the LN8000
+		 * charge pump can run. Use the continuous 5V-9V range like the
+		 * vendor driver: with the discrete "5V or 9V" setting the PMIC
+		 * flagged the QC adapter's 9.06V as USBIN over-voltage
+		 * (USBIN_OV_RT_STS) and kept ICL at 0, so the switching charger
+		 * could not take over from the pump (battery drained while
+		 * plugged in). With 5V-9V it runs at 9V with ICL 3 A.
+		 */
 		rc = regmap_write(chip->regmap,
 				  chip->base + USBIN_ADAPTER_ALLOW_CFG,
-				  USBIN_ADAPTER_ALLOW_5V_OR_9V);
+				  USBIN_ADAPTER_ALLOW_5V_TO_9V);
 		if (rc < 0)
 			return dev_err_probe(chip->dev, rc,
 					     "failed to set adapter allowance\n");
@@ -1350,6 +1407,36 @@ static int smb2_init_hw(struct smb2_chip *chip)
 		if (rc < 0)
 			return dev_err_probe(chip->dev, rc,
 					     "failed to set recharge threshold\n");
+
+		/*
+		 * Re-run AICL every 12 s, as the vendor smb5 driver does. With
+		 * the shared init's rerun time of 0 the first AICL result stuck:
+		 * after a boot with the adapter attached it settled at 250-350 mA
+		 * (less than the system load, battery draining at 5 V) and a
+		 * manual restart then reached 1.9 A.
+		 */
+		rc = regmap_update_bits(chip->regmap,
+					chip->base + AICL_RERUN_TIME_CFG,
+					AICL_RERUN_TIME_MASK, 0x1);
+		if (rc < 0)
+			return dev_err_probe(chip->dev, rc,
+					     "failed to set AICL rerun time\n");
+
+		/*
+		 * The shared init sets USBIN_{HV,LV}_COLLAPSE_RESPONSE_BIT, bits
+		 * 1:0 of USBIN_AICL_OPTIONS_CFG on PMI8998. The vendor PM8150B
+		 * (smb5) driver never sets them, and with them set AICL stops at
+		 * 250 mA: measured on nabu, 0x57 -> ICL 250 mA and the battery
+		 * draining on a 3 A charger, 0x54 -> ICL 1.75 A and +1.1 A into
+		 * the battery (same adapter, AICL restarted both times).
+		 */
+		rc = regmap_update_bits(chip->regmap,
+					chip->base + USBIN_AICL_OPTIONS_CFG,
+					USBIN_HV_COLLAPSE_RESPONSE_BIT |
+					USBIN_LV_COLLAPSE_RESPONSE_BIT, 0);
+		if (rc < 0)
+			return dev_err_probe(chip->dev, rc,
+					     "failed to set AICL options\n");
 
 		/*
 		 * Keep only the hardware hard limit. The hardware soft-limit
