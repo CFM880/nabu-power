@@ -10,6 +10,8 @@
 
 #include <linux/bits.h>
 #include <linux/devm-helpers.h>
+#include <linux/extcon.h>
+#include <linux/extcon-provider.h>
 #include <linux/iio/consumer.h>
 #include <linux/interrupt.h>
 #include <linux/kernel.h>
@@ -453,6 +455,10 @@ struct smb2_chip {
 	struct iio_channel *usb_in_v_chan;
 
 	struct power_supply *chg_psy;
+	/* Nabu: cable presence as an extcon, so the peripheral-only dwc3 port
+	 * can runtime-suspend while nothing is plugged in and be woken by the
+	 * always-on PMIC IRQ when a cable appears. */
+	struct extcon_dev *usb_extcon;
 	struct regulator *dpdm_reg;
 	/* Nabu: SMB5 5V boost for the Type-C port in host mode. */
 	struct regulator_dev *otg_rdev;
@@ -521,6 +527,24 @@ static int smb2_get_prop_usb_online(struct smb2_chip *chip, int *val)
  * Qualcomm "automatic power source detection" aka APSD
  * tells us what type of charger we're connected to.
  */
+static const unsigned int smb2_usb_extcon_cables[] = {
+	EXTCON_USB,
+	EXTCON_NONE,
+};
+
+/*
+ * Tell the USB controller whether a cable is attached.  The PMIC sees VBUS
+ * before the controller does (the controller may even be runtime-suspended),
+ * which is what makes the port's runtime PM workable on this device.
+ */
+static void smb2_sync_usb_extcon(struct smb2_chip *chip, int online)
+{
+	if (!chip->usb_extcon)
+		return;
+
+	extcon_set_state_sync(chip->usb_extcon, EXTCON_USB, !!online);
+}
+
 static int smb2_apsd_get_charger_type(struct smb2_chip *chip, int *val)
 {
 	unsigned int apsd_stat, stat;
@@ -1033,8 +1057,11 @@ static irqreturn_t smb2_handle_batt_overvoltage(int irq, void *data)
 static irqreturn_t smb2_handle_usb_plugin(int irq, void *data)
 {
 	struct smb2_chip *chip = data;
+	int online = 0;
 
 	chip->apsd_retries = 0;
+	if (!smb2_get_prop_usb_online(chip, &online))
+		smb2_sync_usb_extcon(chip, online);
 	power_supply_changed(chip->chg_psy);
 
 	schedule_delayed_work(&chip->status_change_work,
@@ -1547,6 +1574,16 @@ static int smb2_probe(struct platform_device *pdev)
 		return dev_err_probe(chip->dev, PTR_ERR(chip->chg_psy),
 				     "failed to register power supply\n");
 
+	chip->usb_extcon = devm_extcon_dev_allocate(chip->dev,
+						    smb2_usb_extcon_cables);
+	if (IS_ERR(chip->usb_extcon))
+		return dev_err_probe(chip->dev, PTR_ERR(chip->usb_extcon),
+				     "failed to allocate USB extcon\n");
+	rc = devm_extcon_dev_register(chip->dev, chip->usb_extcon);
+	if (rc)
+		return dev_err_probe(chip->dev, rc,
+				     "failed to register USB extcon\n");
+
 	rc = power_supply_get_battery_info(chip->chg_psy, &chip->batt_info);
 	if (rc)
 		return dev_err_probe(chip->dev, rc,
@@ -1635,6 +1672,12 @@ static int smb2_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, chip);
 
 	/* Initialise charger state */
+	{
+		int online = 0;
+
+		if (!smb2_get_prop_usb_online(chip, &online))
+			smb2_sync_usb_extcon(chip, online);
+	}
 	schedule_delayed_work(&chip->status_change_work, 0);
 
 	return 0;

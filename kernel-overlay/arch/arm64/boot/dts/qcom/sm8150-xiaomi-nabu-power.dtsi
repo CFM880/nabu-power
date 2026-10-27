@@ -185,4 +185,31 @@
  */
 &usb_1_dwc3 {
 	dr_mode = "peripheral";
+
+	/*
+	 * VBUS from the charger, not from the Type-C block: the PM8150B TCPM
+	 * never probes on this port, but the charger's cable IRQ lives on the
+	 * always-on SPMI bus, so it is the only source that can still tell the
+	 * controller a cable appeared while it is runtime-suspended.
+	 */
+	extcon = <&pm8150b_charger>;
+};
+
+/*
+ * Let dwc3 runtime-suspend the port while nothing is plugged in.  The glue
+ * driver (drivers/usb/dwc3/dwc3-qcom.c) only enables autosuspend for ports
+ * marked this way, and the charger's extcon resumes the controller when a
+ * cable goes in; with a cable attached dwc3_runtime_checks() keeps it awake.
+ */
+&usb_1 {
+	wakeup-source;
+};
+
+/*
+ * The charger publishes cable presence as an extcon (see
+ * qcom_pmi8998_charger.c, "nabu-usb-vbus"), which is what &usb_1_dwc3 above
+ * consumes.
+ */
+&pm8150b_charger {
+	#extcon-cells = <0>;
 };
