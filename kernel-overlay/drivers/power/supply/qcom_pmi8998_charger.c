@@ -24,6 +24,8 @@
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
 #include <linux/regulator/driver.h>
+#include <linux/regulator/machine.h>
+#include <linux/usb/role.h>
 #include <linux/types.h>
 #include <linux/workqueue.h>
 
@@ -459,6 +461,20 @@ struct smb2_chip {
 	 * can runtime-suspend while nothing is plugged in and be woken by the
 	 * always-on PMIC IRQ when a cable appears. */
 	struct extcon_dev *usb_extcon;
+	/* Nabu: Type-C role detection.  CC is sampled by the SMB5 (the PM8150B
+	 * TYPEC block never sees it on this board), so the role is polled here
+	 * and pushed to the dwc3 role switch. */
+	struct usb_role_switch *role_sw;
+	bool role_sw_reported;
+	int typec_dbg_left;
+	/* 0 = follow CC detection, otherwise force host/device */
+	enum usb_role typec_force;
+	struct delayed_work typec_work;
+	struct regulator *otg_vbus;
+	bool typec_attached;
+	bool typec_dfp;
+	int typec_orientation;
+	enum usb_role typec_role;
 	struct regulator *dpdm_reg;
 	/* Nabu: SMB5 5V boost for the Type-C port in host mode. */
 	struct regulator_dev *otg_rdev;
@@ -527,6 +543,216 @@ static int smb2_get_prop_usb_online(struct smb2_chip *chip, int *val)
  * Qualcomm "automatic power source detection" aka APSD
  * tells us what type of charger we're connected to.
  */
+/*
+ * Nabu: bring the SMB5 Type-C block up in dual-role mode.
+ *
+ * The mainline driver never touches this register block, so the block stays in
+ * its power-on state - disabled - and the CC comparators never sample anything.
+ * That is why neither the PM8150B TCPM nor this driver ever saw a cable: the
+ * attach is simply not being detected by hardware until detection is enabled.
+ */
+static void smb2_typec_init(struct smb2_chip *chip)
+{
+	unsigned int cfg = 0, cfg2 = 0, cfg3 = 0, ctrl = 0, s4 = 0;
+	int rc;
+
+	regmap_read(chip->regmap, chip->base + TYPE_C_CFG, &cfg);
+	regmap_read(chip->regmap, chip->base + TYPE_C_CFG_2, &cfg2);
+	regmap_read(chip->regmap, chip->base + TYPE_C_CFG_3, &cfg3);
+	regmap_read(chip->regmap, chip->base + TYPE_C_INTRPT_ENB_SOFTWARE_CTRL,
+		    &ctrl);
+	regmap_read(chip->regmap, chip->base + TYPE_C_STATUS_4, &s4);
+	dev_info(chip->dev,
+		 "typec init: cfg=%#x cfg2=%#x cfg3=%#x ctrl=%#x status4=%#x\n",
+		 cfg, cfg2, cfg3, ctrl, s4);
+
+	/* dual role: clear TYPEC_DISABLE_CMD, enable both UFP and DFP */
+	rc = regmap_update_bits(chip->regmap,
+				chip->base + TYPE_C_INTRPT_ENB_SOFTWARE_CTRL,
+				TYPEC_POWER_ROLE_CMD_MASK,
+				DFP_EN_CMD_BIT | UFP_EN_CMD_BIT);
+	dev_info(chip->dev, "typec init: drp write rc=%d\n", rc);
+
+	/* run APSD as soon as CC detects a partner (charger classification) */
+	rc = regmap_update_bits(chip->regmap, chip->base + TYPE_C_CFG,
+				APSD_START_ON_CC_BIT, APSD_START_ON_CC_BIT);
+	dev_info(chip->dev, "typec init: apsd write rc=%d\n", rc);
+
+	msleep(50);
+	rc = regmap_read(chip->regmap, chip->base + TYPE_C_INTRPT_ENB_SOFTWARE_CTRL,
+			 &ctrl);
+	dev_info(chip->dev, "typec init: ctrl=%#x (rc=%d)\n", ctrl, rc);
+}
+
+/*
+ * Nabu: apply a Type-C role (host needs the SMB5 5V boost).
+ */
+static void smb2_typec_apply_role(struct smb2_chip *chip, enum usb_role role)
+{
+	int rc;
+
+	if (role == chip->typec_role)
+		return;
+
+	dev_info(chip->dev, "typec: role %d -> %d\n", chip->typec_role, role);
+
+	if (role == USB_ROLE_HOST && chip->otg_vbus) {
+		rc = regulator_enable(chip->otg_vbus);
+		if (rc)
+			dev_warn(chip->dev, "OTG 5V on failed: %d\n", rc);
+	} else if (chip->otg_vbus && chip->typec_role == USB_ROLE_HOST) {
+		regulator_disable(chip->otg_vbus);
+	}
+
+	if (chip->role_sw)
+		usb_role_switch_set_role(chip->role_sw, role);
+	chip->typec_role = role;
+}
+
+/*
+ * The SMB5 Type-C block never reports a CC attach on this board (all status
+ * registers stay 0 even with a device plugged in, see KNOWN-ISSUES), so the
+ * role can only be chosen by hand.  "host" also turns the 5V boost on, which
+ * is what makes a U disk / USB keyboard / USB-C headset work at all.
+ */
+static ssize_t typec_role_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	struct smb2_chip *chip = dev_get_drvdata(dev);
+
+	if (chip->typec_force == USB_ROLE_HOST)
+		return sysfs_emit(buf, "host\n");
+	if (chip->typec_force == USB_ROLE_DEVICE)
+		return sysfs_emit(buf, "device\n");
+	return sysfs_emit(buf, "auto\n");
+}
+
+static ssize_t typec_role_store(struct device *dev,
+				struct device_attribute *attr, const char *buf,
+				size_t count)
+{
+	struct smb2_chip *chip = dev_get_drvdata(dev);
+	enum usb_role role;
+
+	if (sysfs_streq(buf, "host"))
+		role = USB_ROLE_HOST;
+	else if (sysfs_streq(buf, "device"))
+		role = USB_ROLE_DEVICE;
+	else if (sysfs_streq(buf, "auto"))
+		role = USB_ROLE_NONE;
+	else
+		return -EINVAL;
+
+	chip->typec_force = role;
+	smb2_typec_apply_role(chip, role);
+	return count;
+}
+static DEVICE_ATTR_RW(typec_role);
+
+/*
+ * Nabu: read what the SMB5 thinks of the Type-C port.
+ *
+ * TYPE_C_STATUS_4 carries the whole result of the chip's own CC state machine:
+ *   bit 0  CC_ATTACHED          something is on the other end
+ *   bit 1  CC_ORIENTATION       flipped plug
+ *   bit 7  UFP_DFP_MODE_STATUS  0 = we are the UFP (a source/charger is attached,
+ *                               so this port is a device), 1 = we are the DFP
+ *                               (a sink such as an OTG adapter, dock or keyboard
+ *                               cover is attached, so this port is the host)
+ * The PM8150B TYPEC block does not report CC at all on this board, which is why
+ * the mainline TCPM never sees an attach.
+ */
+static void smb2_typec_poll(struct work_struct *work)
+{
+	struct smb2_chip *chip =
+		container_of(work, struct smb2_chip, typec_work.work);
+	unsigned int stat4 = 0;
+	bool attached, dfp;
+	int orientation, online = 0, rc;
+	enum usb_role role;
+
+	rc = regmap_read(chip->regmap, chip->base + TYPE_C_STATUS_4, &stat4);
+	if (rc)
+		goto out;
+
+	if (chip->typec_dbg_left > 0) {
+		unsigned int d1 = 0, d2 = 0, d3 = 0, d4 = 0, d5 = 0, dc = 0,
+			     dg = 0, dg2 = 0;
+
+		chip->typec_dbg_left--;
+		regmap_read(chip->regmap, chip->base + TYPE_C_STATUS_1, &d1);
+		regmap_read(chip->regmap, chip->base + TYPE_C_STATUS_2, &d2);
+		regmap_read(chip->regmap, chip->base + TYPE_C_STATUS_3, &d3);
+		regmap_read(chip->regmap, chip->base + TYPE_C_STATUS_5, &d5);
+		regmap_read(chip->regmap,
+			    chip->base + TYPE_C_INTRPT_ENB_SOFTWARE_CTRL, &dc);
+		regmap_read(chip->regmap, chip->base + TYPE_C_CFG, &dg);
+		regmap_read(chip->regmap, chip->base + TYPE_C_CFG_2, &dg2);
+		dev_info(chip->dev,
+			 "typec dbg: s1=%#x s2=%#x s3=%#x s4=%#x s5=%#x ctrl=%#x cfg=%#x cfg2=%#x\n",
+			 d1, d2, d3, stat4, d5, dc, dg, dg2);
+	}
+
+	/*
+	 * The charger probes before the dwc3 role switch exists, so keep trying
+	 * here instead of failing the probe with -EPROBE_DEFER.  Report the
+	 * failure once so a missing/hidden switch is visible in dmesg.
+	 */
+	if (!chip->role_sw) {
+		chip->role_sw = usb_role_switch_get(chip->dev);
+		if (IS_ERR(chip->role_sw)) {
+			if (!chip->role_sw_reported) {
+				dev_warn(chip->dev,
+					 "no USB role switch yet: %ld\n",
+					 PTR_ERR(chip->role_sw));
+				chip->role_sw_reported = true;
+			}
+			chip->role_sw = NULL;
+		} else {
+			dev_info(chip->dev, "typec: role switch ready\n");
+		}
+	}
+
+	attached = !!(stat4 & CC_ATTACHED_BIT);
+	dfp = !!(stat4 & UFP_DFP_MODE_STATUS_BIT);
+	orientation = !!(stat4 & CC_ORIENTATION_BIT);
+
+	if (attached != chip->typec_attached || dfp != chip->typec_dfp ||
+	    orientation != chip->typec_orientation) {
+		unsigned int s1 = 0, s2 = 0, s5 = 0;
+
+		regmap_read(chip->regmap, chip->base + TYPE_C_STATUS_1, &s1);
+		regmap_read(chip->regmap, chip->base + TYPE_C_STATUS_2, &s2);
+		regmap_read(chip->regmap, chip->base + TYPE_C_STATUS_5, &s5);
+		dev_info(chip->dev,
+			 "typec: attached=%d ufp_dfp=%d orientation=%d status4=%#x s1=%#x s2=%#x s5=%#x\n",
+			 attached, dfp, orientation, stat4, s1, s2, s5);
+		chip->typec_attached = attached;
+		chip->typec_dfp = dfp;
+		chip->typec_orientation = orientation;
+	}
+
+	smb2_get_prop_usb_online(chip, &online);
+
+	if (!attached)
+		role = USB_ROLE_NONE;
+	else if (dfp && !online)
+		/* Sink on the other end and nobody is feeding VBUS: the only way
+		 * this can work is us acting as the host.  The "!online" guard
+		 * keeps a charger from ever being driven with our own 5V. */
+		role = USB_ROLE_HOST;
+	else
+		role = USB_ROLE_DEVICE;
+
+	if (chip->typec_force != USB_ROLE_NONE)
+		role = chip->typec_force;
+
+	smb2_typec_apply_role(chip, role);
+
+out:
+	schedule_delayed_work(&chip->typec_work, msecs_to_jiffies(1000));
+}
+
 static const unsigned int smb2_usb_extcon_cables[] = {
 	EXTCON_USB,
 	EXTCON_NONE,
@@ -1490,6 +1716,17 @@ static const struct regulator_ops smb2_otg_ops = {
 	.is_enabled = smb2_otg_is_enabled,
 };
 
+/*
+ * Without a valid_ops_mask the regulator core refuses regulator_enable() with
+ * -EPERM: this supply has no device tree constraints of its own, so "may change
+ * status" has to be granted here or the OTG 5V boost can never be turned on.
+ */
+static const struct regulator_init_data smb2_otg_init_data = {
+	.constraints = {
+		.valid_ops_mask = REGULATOR_CHANGE_STATUS,
+	},
+};
+
 static const struct regulator_desc smb2_otg_desc = {
 	.name		= "usb-otg-vbus",
 	.type		= REGULATOR_VOLTAGE,
@@ -1633,6 +1870,7 @@ static int smb2_probe(struct platform_device *pdev)
 			.dev			= chip->dev,
 			.driver_data		= chip,
 			.of_node		= chip->dev->of_node,
+			.init_data		= &smb2_otg_init_data,
 		};
 
 		chip->otg_rdev = devm_regulator_register(chip->dev,
@@ -1670,6 +1908,26 @@ static int smb2_probe(struct platform_device *pdev)
 		return dev_err_probe(chip->dev, rc, "Couldn't set wake irq\n");
 
 	platform_set_drvdata(pdev, chip);
+
+	if (chip->is_smb5) {
+		/* obtained on the first typec poll: dwc3 registers its role
+		 * switch after this driver probes */
+		chip->role_sw = NULL;
+
+		chip->otg_vbus = devm_regulator_get_optional(chip->dev,
+							    "usb-otg-vbus");
+		if (IS_ERR(chip->otg_vbus))
+			chip->otg_vbus = NULL;
+
+		chip->typec_role = USB_ROLE_NONE;
+		chip->typec_force = USB_ROLE_NONE;
+		chip->typec_dbg_left = 20;
+		if (device_create_file(chip->dev, &dev_attr_typec_role))
+			dev_warn(chip->dev, "no typec_role attribute\n");
+		smb2_typec_init(chip);
+		INIT_DELAYED_WORK(&chip->typec_work, smb2_typec_poll);
+		schedule_delayed_work(&chip->typec_work, 0);
+	}
 
 	/* Initialise charger state */
 	{

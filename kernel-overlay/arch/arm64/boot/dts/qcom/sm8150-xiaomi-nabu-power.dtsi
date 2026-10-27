@@ -167,30 +167,38 @@
 };
 
 /*
- * Pin the Type-C port to device role.
+ * Type-C role switching, driven by the charger.
  *
- * Dynamic role switching (the base tree's dr_mode = "otg" + usb-role-switch)
- * does not work here: the PM8150B TCPM never reports a CC attach on this port
- * (dmesg only shows "isr: tx_sig"), so it stays in its default source/host
- * role even with a charger plugged in:
+ * The PM8150B TCPM cannot do it: on this board it never reports a CC attach
+ * (dmesg only shows "isr: tx_sig"), so with dr_mode = "otg" it latches the port
+ * to source/host even with a charger plugged in:
  *
  *   data_role = host [device]   power_role = source [sink]
  *
- * Host mode would be useless anyway: it needs 5V out, and mainline's
- * qcom-pmi8998 driver does not expose the SMB5 OTG boost.  Device role is the
- * only useful one - charger and PC - and pinning it keeps the state clean.
+ * The SMB5 charger samples CC itself and reports the result in
+ * TYPE_C_STATUS_4, so qcom_pmi8998_charger.c polls it once a second and drives
+ * the dwc3 role switch: a source on the other end (charger, PC) makes this a
+ * device, a sink (OTG adapter, dock) makes it the host and enables the 5V boost.
  *
  * The keyboard cover is unaffected: it uses usb_2, which the base tree pins to
  * host (dr_mode = "host").
  */
 &usb_1_dwc3 {
-	dr_mode = "peripheral";
+	/*
+	 * Dual role, but the role is decided by the charger driver, not by the
+	 * PM8150B TCPM: on this board CC is sampled by the SMB5 charger and the
+	 * TYPEC block never reports an attach, so the TCPM would latch the port
+	 * to host/source and the gadget would never enumerate.  The charger
+	 * polls TYPE_C_STATUS_4 and pushes USB_ROLE_{NONE,DEVICE,HOST} here.
+	 */
+	dr_mode = "otg";
+	usb-role-switch;
+	role-switch-default-mode = "peripheral";
 
 	/*
-	 * VBUS from the charger, not from the Type-C block: the PM8150B TCPM
-	 * never probes on this port, but the charger's cable IRQ lives on the
-	 * always-on SPMI bus, so it is the only source that can still tell the
-	 * controller a cable appeared while it is runtime-suspended.
+	 * VBUS from the charger, not from the Type-C block: the charger's cable
+	 * IRQ lives on the always-on SPMI bus, so it is the only source that can
+	 * still tell the controller a cable appeared while it is suspended.
 	 */
 	extcon = <&pm8150b_charger>;
 };
@@ -212,4 +220,16 @@
  */
 &pm8150b_charger {
 	#extcon-cells = <0>;
+	/* the dwc3 role switch this driver drives (see smb2_typec_poll) */
+	usb-role-switch = <&usb_1_dwc3>;
+};
+
+/*
+ * The PM8150B TYPEC/PD block never reports a CC attach on nabu (it only ever
+ * raises the PD-PHY "tx_sig" interrupt), so leave the TCPM out of the role
+ * decision; the SMB5 charger owns CC here.  PD negotiation was never working
+ * on this port anyway - charging is APSD/HVDCP through the SMB5.
+ */
+&pm8150b_typec {
+	status = "disabled";
 };
