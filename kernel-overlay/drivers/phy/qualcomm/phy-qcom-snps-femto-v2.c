@@ -311,6 +311,7 @@ static int qcom_snps_hsphy_dpdm_disable(struct regulator_dev *rdev)
 				   OPMODE_MASK, OPMODE_NORMAL);
 	qcom_snps_hsphy_write_mask(hsphy->base, USB2_PHY_USB_PHY_CFG0,
 				   UTMI_PHY_DATAPATH_CTRL_OVERRIDE_EN, 0);
+
 	qcom_snps_hsphy_write_mask(hsphy->base, USB2_PHY_USB_PHY_HS_PHY_CTRL2,
 				   USB2_SUSPEND_N_SEL | USB2_SUSPEND_N, 0);
 
@@ -584,6 +585,14 @@ static int qcom_snps_hsphy_init(struct phy *phy)
 	qcom_snps_hsphy_write_mask(hsphy->base,
 					USB2_PHY_USB_PHY_HS_PHY_CTRL_COMMON2,
 					VREGBYPASS, VREGBYPASS);
+
+	dev_info(&phy->dev,
+		 "nabu: mode=%d UTMI_CTRL0=%#x CFG0=%#x HS_CTRL2=%#x UTMI_CTRL5=%#x\n",
+		 hsphy->mode,
+		 readl(hsphy->base + USB2_PHY_USB_PHY_UTMI_CTRL0),
+		 readl(hsphy->base + USB2_PHY_USB_PHY_CFG0),
+		 readl(hsphy->base + USB2_PHY_USB_PHY_HS_PHY_CTRL2),
+		 readl(hsphy->base + USB2_PHY_USB_PHY_UTMI_CTRL5));
 
 	qcom_snps_hsphy_write_mask(hsphy->base, USB2_PHY_USB_PHY_HS_PHY_CTRL2,
 					USB2_SUSPEND_N_SEL | USB2_SUSPEND_N,

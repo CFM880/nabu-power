@@ -47,6 +47,7 @@
 			 */
 			dpdm-supply = <&usb_1_hsphy>;
 
+
 			/* dpdm-supply is set further down (it needs the PHY
 			 * handle, which is only correct after the port is
 			 * pinned to dual role). */
