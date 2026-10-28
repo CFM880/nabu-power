@@ -154,6 +154,9 @@
 	qcom,fg-empty-voltage = <3100>;
 	qcom,ki-coeff-low-chg = <315>;
 	qcom,ki-coeff-med-chg = <183>;
+	qcom,ki-coeff-chg-low-med-thresh-ma = <500>;
+	qcom,ki-coeff-chg-med-hi-thresh-ma = <1000>;
+	qcom,fg-esr-pulse-thresh-ma = <47>;
 	qcom,fg-delta-soc-thr = <5>;
 };
 

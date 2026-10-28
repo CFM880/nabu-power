@@ -121,6 +121,15 @@
 #define FG4_ESR_PULSE_NUMR		1000
 #define FG4_ESR_PULSE_DENR		15625
 #define FG4_ESR_PULSE_DEFAULT_MA	47
+/* KI coefficient current thresholds (vendor fg_gen4_set_ki_coeff_curr()) */
+#define FG4_KI_THR_LO_MED_WORD		29
+#define FG4_KI_THR_LO_MED_OFFSET	1
+#define FG4_KI_THR_MED_HI_WORD		30
+#define FG4_KI_THR_MED_HI_OFFSET	0
+#define FG4_KI_THR_NUMR			1000
+#define FG4_KI_THR_DENR			15625
+#define FG4_KI_THR_LO_MED_DEFAULT_MA	500
+#define FG4_KI_THR_MED_HI_DEFAULT_MA	1000
 #define HLOS_RESTART_BIT		BIT(3)
 
 #define CUTOFF_CURR_WORD		19
@@ -1923,9 +1932,49 @@ static int qcom_fg_gen4_write_esr_thresh(struct qcom_fg_chip *chip)
 				       1, &raw, 1);
 }
 
+/*
+ * Nabu: the current thresholds that tell the gauge which KI coefficient to use
+ * while charging.  Without them the thresholds hold power-on values and the
+ * gauge integrates charge with the wrong coefficient, which made the reported
+ * charge advance ~1.7x faster than the charge actually going in while
+ * discharge stayed close to accurate (measured 2026-10-28).
+ */
+static int qcom_fg_gen4_write_ki_threshs(struct qcom_fg_chip *chip)
+{
+	struct device_node *np = chip->dev->of_node;
+	u32 lo_med = FG4_KI_THR_LO_MED_DEFAULT_MA;
+	u32 med_hi = FG4_KI_THR_MED_HI_DEFAULT_MA;
+	u8 lo_raw, hi_raw;
+	int ret;
+
+	of_property_read_u32(np, "qcom,ki-coeff-chg-low-med-thresh-ma", &lo_med);
+	of_property_read_u32(np, "qcom,ki-coeff-chg-med-hi-thresh-ma", &med_hi);
+
+	lo_raw = DIV_ROUND_CLOSEST(lo_med * FG4_KI_THR_NUMR, FG4_KI_THR_DENR);
+	hi_raw = DIV_ROUND_CLOSEST(med_hi * FG4_KI_THR_NUMR, FG4_KI_THR_DENR);
+
+	ret = qcom_fg_gen4_sram_write(chip, FG4_KI_THR_LO_MED_WORD,
+				      FG4_KI_THR_LO_MED_OFFSET, &lo_raw, 1);
+	if (ret)
+		return ret;
+
+	ret = qcom_fg_gen4_sram_write(chip, FG4_KI_THR_MED_HI_WORD,
+				      FG4_KI_THR_MED_HI_OFFSET, &hi_raw, 1);
+	if (ret)
+		return ret;
+
+	dev_info(chip->dev, "KI thresholds: low-med %u mA (raw %u), med-hi %u mA (raw %u)\n",
+		 lo_med, lo_raw, med_hi, hi_raw);
+	return 0;
+}
+
 static int qcom_fg_gen4_configure(struct qcom_fg_chip *chip)
 {
 	int ret;
+
+	ret = qcom_fg_gen4_write_ki_threshs(chip);
+	if (ret)
+		dev_warn(chip->dev, "failed to write KI thresholds: %d\n", ret);
 
 	ret = qcom_fg_gen4_write_esr_thresh(chip);
 	if (ret)
