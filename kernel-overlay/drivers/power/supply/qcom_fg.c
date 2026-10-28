@@ -203,6 +203,7 @@ struct qcom_fg_chip {
 	struct power_supply_battery_info *batt_info;
 	struct power_supply *chg_psy;
 	int status;
+	int last_status;	/* to detect the charge-full transition */
 	struct delayed_work status_changed_work;
 
 	struct completion sram_access_granted;
@@ -1448,6 +1449,39 @@ static void qcom_fg_status_changed_worker(struct work_struct *work)
 	power_supply_changed(chip->batt_psy);
 }
 
+/*
+ * Nabu: tell the gauge where "full" is, the way the vendor's
+ * fg_gen4_configure_full_soc() does once the mask clears: FULL_SOC gets the
+ * current coulomb-counted SOC (0.01%) and MONOTONIC gets the 0xFFFF marker.
+ * Without it FULL_SOC keeps its power-on value (0xFFFF, i.e. "no full point"),
+ * which distorts the top of the voltage-to-SOC curve - the region where our
+ * reported charge was measured running fastest.
+ */
+static void qcom_fg_mark_full(struct qcom_fg_chip *chip)
+{
+	u8 full[2] = { 0xff, 0xff }, bsoc[2];
+	unsigned int cap = 0;
+	int b, ret;
+
+	if (chip->ops->get_capacity &&
+	    chip->ops->get_capacity(chip, (int *)&cap))
+		return;
+
+	b = DIV_ROUND_CLOSEST(cap * 100, 1);	/* to 0.01% */
+	bsoc[0] = b & 0xff;
+	bsoc[1] = (b >> 8) & 0xff;
+
+	ret = qcom_fg_gen4_sram_write(chip, FG4_FULL_SOC_WORD, 0, bsoc, 2);
+	if (ret)
+		return;
+	ret = qcom_fg_gen4_sram_write(chip, FG4_MONOTONIC_SOC_WORD, 0, full, 2);
+	if (ret)
+		return;
+
+	dev_info(chip->dev, "charge full: FULL_SOC marked at %u%% (bsoc=%d)\n",
+		 cap, b);
+}
+
 static int qcom_fg_notifier_call(struct notifier_block *nb,
 		unsigned long val, void *v)
 {
@@ -1463,6 +1497,11 @@ static int qcom_fg_notifier_call(struct notifier_block *nb,
 			chip->status = POWER_SUPPLY_STATUS_UNKNOWN;
 		else
 			chip->status = propval.intval;
+
+		if (chip->status == POWER_SUPPLY_STATUS_FULL &&
+		    chip->last_status != POWER_SUPPLY_STATUS_FULL)
+			qcom_fg_mark_full(chip);
+		chip->last_status = chip->status;
 
 		power_supply_changed(chip->batt_psy);
 
