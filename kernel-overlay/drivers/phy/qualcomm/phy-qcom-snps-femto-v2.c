@@ -299,6 +299,21 @@ static int qcom_snps_hsphy_dpdm_disable(struct regulator_dev *rdev)
 	if (!hsphy->dpdm_enabled)
 		return 0;
 
+	/*
+	 * Nabu: put the PHY back into normal driving mode.  Upstream only drops
+	 * the bookkeeping flag here, so after the charger has borrowed Dp/Dm
+	 * once (APSD/QC detection) the UTMI overrides set by dpdm_enable() stay
+	 * in place and the PHY keeps Dp/Dm high-Z for ever - the port then
+	 * reports "power" but never "connect", which is exactly why Type-C host
+	 * mode could not see a device.
+	 */
+	qcom_snps_hsphy_write_mask(hsphy->base, USB2_PHY_USB_PHY_UTMI_CTRL0,
+				   OPMODE_MASK, OPMODE_NORMAL);
+	qcom_snps_hsphy_write_mask(hsphy->base, USB2_PHY_USB_PHY_CFG0,
+				   UTMI_PHY_DATAPATH_CTRL_OVERRIDE_EN, 0);
+	qcom_snps_hsphy_write_mask(hsphy->base, USB2_PHY_USB_PHY_HS_PHY_CTRL2,
+				   USB2_SUSPEND_N_SEL | USB2_SUSPEND_N, 0);
+
 	if (!hsphy->phy_initialized) {
 		reset_control_assert(hsphy->phy_reset);
 		regulator_bulk_disable(ARRAY_SIZE(hsphy->vregs), hsphy->vregs);
@@ -539,6 +554,19 @@ static int qcom_snps_hsphy_init(struct phy *phy)
 					PLLBTUNE, PLLBTUNE);
 	qcom_snps_hsphy_write_mask(hsphy->base, USB2_PHY_USB_PHY_REFCLK_CTRL,
 					REFCLK_SEL_DEFAULT, REFCLK_SEL_MASK);
+
+	/*
+	 * Nabu: make sure the PHY drives Dp/Dm itself.  The charger borrows the
+	 * lines for APSD/QC detection through the "dpdm" regulator, and that can
+	 * happen before this PHY is powered (so the matching clear in
+	 * dpdm_disable() writes into a PHY that is not clocked yet).  Re-apply
+	 * normal mode here, i.e. every time the PHY is brought up, otherwise the
+	 * port reports "power" but never "connect" and host mode sees no device.
+	 */
+	qcom_snps_hsphy_write_mask(hsphy->base, USB2_PHY_USB_PHY_UTMI_CTRL0,
+				   OPMODE_MASK, OPMODE_NORMAL);
+	qcom_snps_hsphy_write_mask(hsphy->base, USB2_PHY_USB_PHY_CFG0,
+				   UTMI_PHY_DATAPATH_CTRL_OVERRIDE_EN, 0);
 	qcom_snps_hsphy_write_mask(hsphy->base,
 					USB2_PHY_USB_PHY_HS_PHY_CTRL_COMMON1,
 					VBUSVLDEXTSEL0, VBUSVLDEXTSEL0);

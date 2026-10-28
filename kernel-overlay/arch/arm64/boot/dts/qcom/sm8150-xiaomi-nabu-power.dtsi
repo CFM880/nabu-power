@@ -35,11 +35,21 @@
 			io-channel-names = "usbin_i", "usbin_v";
 
 			/*
-			 * No dpdm-supply: handing D+/D- to the PMIC for APSD/QC
-			 * leaves dwc3 without them, so the UDC never attaches and
-			 * the nabu-serial console never enumerates.  We lose fast
-			 * charger detection, the 5V path still charges.
+			 * D+/D- ownership switch.  The HS PHY exposes a "dpdm"
+			 * regulator whose enable() puts the PHY in UTMI
+			 * non-driving mode so the charger can drive Dp/Dm for
+			 * APSD/QC detection, and whose disable() hands them back
+			 * to the SoC.  The driver only enables it around the APSD
+			 * sequence, so the PHY owns the lines the rest of the
+			 * time - without this property nothing ever takes them
+			 * back and the Type-C port cannot see a device in host
+			 * mode (xHCI reports "port power" but never "connect").
 			 */
+			dpdm-supply = <&usb_1_hsphy>;
+
+			/* dpdm-supply is set further down (it needs the PHY
+			 * handle, which is only correct after the port is
+			 * pinned to dual role). */
 
 			monitored-battery = <&battery>;
 			status = "okay";
