@@ -282,6 +282,30 @@
 #define CMD_HVDCP_2					0x343
 #define HVDCP_FORCE_9V_BIT				BIT(4)
 
+/*
+ * Nabu: the SMB5 Type-C block lives at its own base (0x1500), not in the
+ * charger window.  The 0x3xx addresses that used to be used here belong to a
+ * different PMIC generation: every Type-C write went to an unrelated register
+ * and every read came back 0, which is why the port never left its power-on
+ * role and never sourced VBUS.
+ */
+#define SMB5_TYPEC_BASE				0x1500
+#define SMB5_TYPE_C_MODE_CFG			(SMB5_TYPEC_BASE + 0x44)
+#define SMB5_TYPE_C_SNK_STATUS			(SMB5_TYPEC_BASE + 0x06)
+#define SMB5_TYPE_C_SRC_STATUS			(SMB5_TYPEC_BASE + 0x08)
+#define SMB5_TYPE_C_STATE_MACHINE_STATUS	(SMB5_TYPEC_BASE + 0x09)
+#define SMB5_TYPE_C_MISC_STATUS			(SMB5_TYPEC_BASE + 0x0B)
+#define SMB5_TYPE_C_CURRSRC_CFG			(SMB5_TYPEC_BASE + 0x52)
+
+/* power role commands, per the vendor's smb5-reg.h */
+#define TYPEC_POWER_ROLE_MASK			GENMASK(2, 0)
+#define TYPEC_ROLE_SRC_ONLY			BIT(2)
+#define TYPEC_ROLE_SNK_ONLY			BIT(1)
+#define TYPEC_ROLE_DISABLE			BIT(0)
+#define TYPEC_TRY_MODE_MASK			GENMASK(4, 3)
+#define TYPEC_TRY_SNK				BIT(4)
+#define TYPEC_TRY_SRC				BIT(3)
+
 #define TYPE_C_INTRPT_ENB_SOFTWARE_CTRL			0x368
 #define EXIT_SNK_BASED_ON_CC_BIT			BIT(7)
 #define VCONN_EN_ORIENTATION_BIT			BIT(6)
@@ -563,12 +587,14 @@ static void smb2_typec_init(struct smb2_chip *chip)
 	regmap_read(chip->regmap, chip->base + TYPE_C_CFG, &cfg);
 	regmap_read(chip->regmap, chip->base + TYPE_C_CFG_2, &cfg2);
 	regmap_read(chip->regmap, chip->base + TYPE_C_CFG_3, &cfg3);
-	regmap_read(chip->regmap, chip->base + TYPE_C_INTRPT_ENB_SOFTWARE_CTRL,
-		    &ctrl);
-	regmap_read(chip->regmap, chip->base + TYPE_C_STATUS_4, &s4);
+	regmap_read(chip->regmap, SMB5_TYPE_C_MODE_CFG, &ctrl);
+	regmap_read(chip->regmap, SMB5_TYPE_C_MISC_STATUS, &s4);
 	dev_info(chip->dev,
-		 "typec init: cfg=%#x cfg2=%#x cfg3=%#x ctrl=%#x status4=%#x\n",
-		 cfg, cfg2, cfg3, ctrl, s4);
+		 "typec init: cfg=%#x cfg2=%#x cfg3=%#x mode_cfg=%#x misc=%#x snk=%#x src=%#x state=%#x\n",
+		 cfg, cfg2, cfg3, ctrl, s4,
+		 ({ unsigned int v = 0; regmap_read(chip->regmap, SMB5_TYPE_C_SNK_STATUS, &v); v; }),
+		 ({ unsigned int v = 0; regmap_read(chip->regmap, SMB5_TYPE_C_SRC_STATUS, &v); v; }),
+		 ({ unsigned int v = 0; regmap_read(chip->regmap, SMB5_TYPE_C_STATE_MACHINE_STATUS, &v); v; }));
 
 	/* dual role: clear TYPEC_DISABLE_CMD, enable both UFP and DFP */
 	rc = regmap_update_bits(chip->regmap,
@@ -591,25 +617,50 @@ static void smb2_typec_init(struct smb2_chip *chip)
 /*
  * Nabu: apply a Type-C role (host needs the SMB5 5V boost).
  */
-static void smb2_typec_apply_role(struct smb2_chip *chip, enum usb_role role)
+static void smb2_typec_set_mode(struct smb2_chip *chip, enum usb_role role)
 {
+	u8 val;
 	int rc;
 
+	switch (role) {
+	case USB_ROLE_HOST:
+		val = TYPEC_ROLE_SRC_ONLY;	/* we source VBUS */
+		break;
+	case USB_ROLE_DEVICE:
+		val = TYPEC_ROLE_SNK_ONLY;
+		break;
+	default:
+		val = TYPEC_ROLE_SNK_ONLY;
+		break;
+	}
+
+	rc = regmap_update_bits(chip->regmap, SMB5_TYPE_C_MODE_CFG,
+				TYPEC_POWER_ROLE_MASK | TYPEC_TRY_MODE_MASK,
+				val);
+	if (rc)
+		dev_warn(chip->dev, "typec: mode cfg write failed: %d\n", rc);
+
+	if (chip->role_sw)
+		usb_role_switch_set_role(chip->role_sw, role);
+}
+
+static void smb2_typec_apply_role(struct smb2_chip *chip, enum usb_role role)
+{
 	if (role == chip->typec_role)
 		return;
 
 	dev_info(chip->dev, "typec: role %d -> %d\n", chip->typec_role, role);
 
-	if (role == USB_ROLE_HOST && chip->otg_vbus) {
-		rc = regulator_enable(chip->otg_vbus);
-		if (rc)
-			dev_warn(chip->dev, "OTG 5V on failed: %d\n", rc);
-	} else if (chip->otg_vbus && chip->typec_role == USB_ROLE_HOST) {
-		regulator_disable(chip->otg_vbus);
-	}
+	/*
+	 * NOTE: dwc3 drops the first role request after boot - the host
+	 * controller never appears even though the switch reports success.  A
+	 * second, spaced request works, so users switch with
+	 *   echo auto > typec_role ; sleep 3 ; echo host > typec_role
+	 * (see KNOWN-ISSUES 2.6.1).  Bouncing the role from the driver was
+	 * tried and made things worse, so it is left to the caller for now.
+	 */
+	smb2_typec_set_mode(chip, role);
 
-	if (chip->role_sw)
-		usb_role_switch_set_role(chip->role_sw, role);
 	chip->typec_role = role;
 }
 
