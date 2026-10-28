@@ -117,6 +117,7 @@
 	 * register reports a meaningless, near-full value.
 	 */
 	qcom,fg-force-load-profile;
+	qcom,fg-batt-capacity-mah = <8720>;
 	qcom,fg-profile-data = [
 		09 00 9B DB 1B D5 75 DA 68 D5 00 00 99 B5 42 83
 		FA 87 1E 93 02 8D EA 87 18 00 33 FC E8 12 C5 04

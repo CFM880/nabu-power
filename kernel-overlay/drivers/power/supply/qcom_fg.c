@@ -104,6 +104,10 @@
 #define FIRST_LOG_CURRENT_WORD		471
 #define FIRST_LOG_CURRENT_OFFSET	0
 #define PROFILE_LOAD_BIT		BIT(0)
+
+/* SRAM word of the learned "actual battery capacity" (vendor qpnp-fg-gen4:
+ * ACT_BATT_CAP_WORD), 2 bytes little endian, unit mAh. */
+#define FG4_ACT_BATT_CAP_WORD		285
 #define HLOS_RESTART_BIT		BIT(3)
 
 #define CUTOFF_CURR_WORD		19
@@ -598,6 +602,64 @@ static ssize_t sram_dump_show(struct device *dev, struct device_attribute *attr,
 	return len;
 }
 static DEVICE_ATTR_RO(sram_dump);
+
+static int qcom_fg_gen4_sram_read(struct qcom_fg_chip *chip, u16 word,
+				 u8 offset, u8 *val, int len);
+
+/*
+ * Nabu: the SRAM parameters the vendor gauge driver uses for its SOC model.
+ * Word/offset pairs taken from the vendor tree (qpnp-fg-gen4.c, PM8150B v1/v2
+ * tables), so the values can be compared with what the vendor algorithm sees.
+ */
+static ssize_t soc_params_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	static const struct { const char *name; u16 word; int len; } p[] = {
+		{ "ACT_BATT_CAP", 285, 2 },	/* learned capacity */
+		{ "BATT_SOC",     449, 4 },
+		{ "FULL_SOC",     455, 2 },
+		{ "CC_SOC",       460, 4 },
+		{ "MONOTONIC",    463, 2 },
+	};
+	struct qcom_fg_chip *chip = dev_get_drvdata(dev);
+	int i, j, len = 0;
+	u8 v[4];
+
+	for (i = 0; i < ARRAY_SIZE(p); i++) {
+		if (qcom_fg_gen4_sram_read(chip, p[i].word, 0, v, p[i].len)) {
+			len += sysfs_emit_at(buf, len, "%-13s read failed\n",
+					     p[i].name);
+			continue;
+		}
+		len += sysfs_emit_at(buf, len, "%-13s w%-4u", p[i].name,
+				     p[i].word);
+		for (j = 0; j < p[i].len; j++)
+			len += sysfs_emit_at(buf, len, " %02x", v[j]);
+		len += sysfs_emit_at(buf, len, "\n");
+	}
+	return len;
+}
+static DEVICE_ATTR_RO(soc_params);
+
+/* Nabu: hex dump of the battery profile block as the gauge currently holds it
+ * (SRAM word 65, 416 bytes), so it can be compared with the DT blob. */
+static ssize_t profile_dump_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	struct qcom_fg_chip *chip = dev_get_drvdata(dev);
+	u8 v[PROFILE_LEN];
+	int i, len = 0;
+
+	if (qcom_fg_gen4_sram_read(chip, PROFILE_LOAD_WORD, PROFILE_LOAD_OFFSET,
+				   v, PROFILE_LEN))
+		return sysfs_emit(buf, "read failed\n");
+
+	for (i = 0; i < PROFILE_LEN; i++)
+		len += sysfs_emit_at(buf, len, "%02x%s", v[i],
+				     (i % 16 == 15) ? "\n" : " ");
+	return len;
+}
+static DEVICE_ATTR_RO(profile_dump);
 
 static int qcom_fg_get_capacity(struct qcom_fg_chip *chip, int *val)
 {
@@ -1679,9 +1741,42 @@ static int qcom_fg_gen4_load_profile(struct qcom_fg_chip *chip)
 	return 0;
 }
 
+/*
+ * Nabu: seed the gauge's "actual battery capacity" SRAM word.
+ *
+ * The vendor driver learns this value over charge cycles and mirrors it into
+ * SDAM; we have neither, so the word held an uninitialised value and every SOC
+ * the model produced was scaled by it - measured on 2026-10-28 the reported
+ * charge advanced 3.5x faster than the charge that actually went in
+ * (148 mAh in -> +6% of 8720 mAh).  Seed it with the pack's design capacity;
+ * the algorithm keeps maintaining it from there.
+ */
+static int qcom_fg_gen4_seed_capacity(struct qcom_fg_chip *chip)
+{
+	struct device_node *np = chip->dev->of_node;
+	u16 cap_mah = 8720;
+	u32 v;
+	int ret;
+
+	if (!of_property_read_u32(np, "qcom,fg-batt-capacity-mah", &v))
+		cap_mah = v;
+
+	ret = qcom_fg_gen4_sram_write(chip, FG4_ACT_BATT_CAP_WORD, 0,
+				      (u8 *)&cap_mah, 2);
+	if (!ret)
+		dev_info(chip->dev, "gauge capacity seeded to %u mAh\n",
+			 cap_mah);
+	return ret;
+}
+
 static int qcom_fg_gen4_configure(struct qcom_fg_chip *chip)
 {
 	int ret;
+
+	ret = qcom_fg_gen4_seed_capacity(chip);
+	if (ret)
+		dev_warn(chip->dev, "failed to seed battery capacity: %d\n",
+			 ret);
 
 	ret = qcom_fg_gen4_write_params(chip);
 	if (ret) {
@@ -1772,6 +1867,10 @@ static int qcom_fg_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, chip);
 	if (device_create_file(chip->dev, &dev_attr_sram_dump))
 		dev_warn(chip->dev, "no sram_dump attribute\n");
+	if (device_create_file(chip->dev, &dev_attr_soc_params))
+		dev_warn(chip->dev, "no soc_params attribute\n");
+	if (device_create_file(chip->dev, &dev_attr_profile_dump))
+		dev_warn(chip->dev, "no profile_dump attribute\n");
 
 	ret = power_supply_get_battery_info(chip->batt_psy, &chip->batt_info);
 	if (ret) {
