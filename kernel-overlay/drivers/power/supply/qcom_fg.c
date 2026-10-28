@@ -1607,6 +1607,34 @@ static int qcom_fg_gen4_load_profile(struct qcom_fg_chip *chip)
 		return -EINVAL;
 	}
 
+	/*
+	 * Only load the profile when the gauge does not already carry one.
+	 *
+	 * The profile lives in PMIC SRAM, which survives an AP reboot (the PMIC
+	 * stays powered), and the load sequence ends with HLOS_RESTART - which
+	 * makes the gauge throw away its accumulated state and re-derive the
+	 * state of charge from the open-circuit voltage.  Doing that on every
+	 * boot is what made the reported charge jump by ~20 points across a
+	 * single reboot (56% -> 77% on 2026-10-27) even though only ~1% of the
+	 * pack had been used.  Load once, then leave the algorithm alone.
+	 */
+	{
+		u8 integrity = 0;
+		int rc = qcom_fg_gen4_sram_read(chip, PROFILE_INTEGRITY_WORD,
+						PROFILE_INTEGRITY_OFFSET,
+						&integrity, 1);
+
+		dev_dbg(chip->dev,
+			"profile integrity probe: rc=%d value=%#x\n", rc,
+			integrity);
+		if (!rc && (integrity & PROFILE_LOAD_BIT)) {
+			dev_info(chip->dev,
+				 "battery profile already present (integrity=%#x), keeping gauge state\n",
+				 integrity);
+			return 0;
+		}
+	}
+
 	/* Quiesce the gauge algorithm while the profile is replaced. */
 	ret = qcom_fg_masked_write(chip, BATT_SOC_RESTART, RESTART_GO_BIT, 0);
 	if (ret)
