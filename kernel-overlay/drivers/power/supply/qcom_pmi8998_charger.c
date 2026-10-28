@@ -192,6 +192,10 @@
 #define CC_ATTACHED_BIT					BIT(0)
 
 #define TYPE_C_STATUS_5					0x30F
+
+/* Polling CC keeps the SoC from staying in its deepest s2idle state, so it is
+ * opt-in: only "auto" in typec_role starts it. */
+#define SMB2_TYPEC_POLL_MS				2000
 #define TRY_SOURCE_FAILED_BIT				BIT(6)
 #define TRY_SINK_FAILED_BIT				BIT(5)
 #define TIMER_STAGE_2_BIT				BIT(4)
@@ -645,6 +649,12 @@ static ssize_t typec_role_store(struct device *dev,
 
 	chip->typec_force = role;
 	smb2_typec_apply_role(chip, role);
+
+	if (role == USB_ROLE_NONE)	/* "auto": start polling CC */
+		schedule_delayed_work(&chip->typec_work, 0);
+	else
+		cancel_delayed_work_sync(&chip->typec_work);
+
 	return count;
 }
 static DEVICE_ATTR_RW(typec_role);
@@ -744,13 +754,18 @@ static void smb2_typec_poll(struct work_struct *work)
 	else
 		role = USB_ROLE_DEVICE;
 
-	if (chip->typec_force != USB_ROLE_NONE)
-		role = chip->typec_force;
-
-	smb2_typec_apply_role(chip, role);
+	if (chip->typec_force != USB_ROLE_NONE) {
+		smb2_typec_apply_role(chip, chip->typec_force);
+	} else if (attached && dfp && !online) {
+		smb2_typec_apply_role(chip, USB_ROLE_HOST);
+	} else if (!attached && chip->typec_role == USB_ROLE_HOST) {
+		smb2_typec_apply_role(chip, USB_ROLE_NONE);
+	}
 
 out:
-	schedule_delayed_work(&chip->typec_work, msecs_to_jiffies(1000));
+	if (chip->typec_force == USB_ROLE_NONE)
+		schedule_delayed_work(&chip->typec_work,
+				      msecs_to_jiffies(SMB2_TYPEC_POLL_MS));
 }
 
 static const unsigned int smb2_usb_extcon_cables[] = {
@@ -1926,7 +1941,16 @@ static int smb2_probe(struct platform_device *pdev)
 			dev_warn(chip->dev, "no typec_role attribute\n");
 		smb2_typec_init(chip);
 		INIT_DELAYED_WORK(&chip->typec_work, smb2_typec_poll);
-		schedule_delayed_work(&chip->typec_work, 0);
+		/* no polling by default: it would keep the SoC out of its deepest
+		 * s2idle state, and CC reports nothing on this board anyway */
+		{
+			unsigned int s4 = 0;
+
+			regmap_read(chip->regmap, chip->base + TYPE_C_STATUS_4,
+				    &s4);
+			dev_info(chip->dev,
+				 "typec init: status4=%#x (no polling)\n", s4);
+		}
 	}
 
 	/* Initialise charger state */

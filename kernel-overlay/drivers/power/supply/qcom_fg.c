@@ -569,6 +569,36 @@ out:
  * @param val Pointer to store value at
  * @return int 0 on success, negative errno on error
  */
+/*
+ * Nabu: dump the fuel gauge SRAM parameter block so the charge counter can be
+ * identified on real hardware (the vendor SRAM map is not documented in this
+ * tree).  Read-only and only on demand, so it costs nothing when unused.
+ */
+static ssize_t sram_dump_show(struct device *dev, struct device_attribute *attr,
+			      char *buf)
+{
+	struct qcom_fg_chip *chip = dev_get_drvdata(dev);
+	unsigned int addr;
+	int len = 0, i;
+	u8 v[2];
+
+	len += sysfs_emit_at(buf, len, "addr  value\n");
+	for (addr = 0x180; addr <= 0x1fe; addr += 2) {
+		if (qcom_fg_read(chip, v, addr, 2))
+			continue;
+		len += sysfs_emit_at(buf, len, "0x%03x %5u  (0x%02x%02x)\n",
+				     addr, (v[0] << 8) | v[1], v[0], v[1]);
+	}
+	/* the monotonic SOC register itself, for reference */
+	for (i = 0; i < 4; i++) {
+		if (qcom_fg_read(chip, v, 0x008 + i, 1))
+			continue;
+		len += sysfs_emit_at(buf, len, "0x%03x %5u\n", 0x008 + i, v[0]);
+	}
+	return len;
+}
+static DEVICE_ATTR_RO(sram_dump);
+
 static int qcom_fg_get_capacity(struct qcom_fg_chip *chip, int *val)
 {
 	u8 cap[2];
@@ -1712,6 +1742,8 @@ static int qcom_fg_probe(struct platform_device *pdev)
 	}
 
 	platform_set_drvdata(pdev, chip);
+	if (device_create_file(chip->dev, &dev_attr_sram_dump))
+		dev_warn(chip->dev, "no sram_dump attribute\n");
 
 	ret = power_supply_get_battery_info(chip->batt_psy, &chip->batt_info);
 	if (ret) {
