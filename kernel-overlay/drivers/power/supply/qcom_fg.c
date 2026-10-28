@@ -116,6 +116,11 @@
 #define FG4_FULL_SOC_WORD		461
 #define FG4_CC_SOC_WORD			466
 #define FG4_MONOTONIC_SOC_WORD		469
+/* ESR measurement pulse threshold, vendor default 47 mA, encoding 1000/15625 */
+#define FG4_ESR_PULSE_THRESH_WORD	12
+#define FG4_ESR_PULSE_NUMR		1000
+#define FG4_ESR_PULSE_DENR		15625
+#define FG4_ESR_PULSE_DEFAULT_MA	47
 #define HLOS_RESTART_BIT		BIT(3)
 
 #define CUTOFF_CURR_WORD		19
@@ -613,6 +618,9 @@ static DEVICE_ATTR_RO(sram_dump);
 
 static int qcom_fg_gen4_sram_read(struct qcom_fg_chip *chip, u16 word,
 				 u8 offset, u8 *val, int len);
+static int qcom_fg_gen4_sram_write(struct qcom_fg_chip *chip, u16 word,
+				  u8 offset, const u8 *val, int len);
+static int qcom_fg_gen4_restart(struct qcom_fg_chip *chip);
 
 /*
  * Nabu: the SRAM parameters the vendor gauge driver uses for its SOC model.
@@ -623,15 +631,36 @@ static ssize_t soc_params_show(struct device *dev,
 			       struct device_attribute *attr, char *buf)
 {
 	static const struct { const char *name; u16 word; int len; } p[] = {
-		{ "ACT_BATT_CAP", FG4_ACT_BATT_CAP_WORD, 2 },
-		{ "BATT_SOC",     FG4_BATT_SOC_WORD,     4 },
-		{ "FULL_SOC",     FG4_FULL_SOC_WORD,     2 },
-		{ "CC_SOC",       FG4_CC_SOC_WORD,       4 },
-		{ "MONOTONIC",    FG4_MONOTONIC_SOC_WORD, 2 },
+		/* v2 words (the vendor default) ... */
+		{ "ACT_BATT_CAP_v2", FG4_ACT_BATT_CAP_WORD,    2 },
+		{ "BATT_SOC_v2",     FG4_BATT_SOC_WORD,        4 },
+		{ "FULL_SOC_v2",     FG4_FULL_SOC_WORD,        2 },
+		{ "CC_SOC_v2",       FG4_CC_SOC_WORD,          4 },
+		{ "MONOTONIC_v2",    FG4_MONOTONIC_SOC_WORD,   2 },
+		/* ... and the v1 words, to tell the two chip revisions apart */
+		{ "ACT_BATT_CAP_v1", 285, 2 },
+		{ "BATT_SOC_v1",     449, 4 },
+		{ "FULL_SOC_v1",     455, 2 },
+		{ "MONOTONIC_v1",    463, 2 },
 	};
 	struct qcom_fg_chip *chip = dev_get_drvdata(dev);
 	int i, j, len = 0;
 	u8 v[4];
+
+	/* SPMI PMIC identification: rev4 (0x103) chooses the vendor table,
+	 * subtype (0x105) tells which PMIC this is. */
+	{
+		unsigned int type = 0, subtype = 0, rev2 = 0, rev3 = 0, rev4 = 0;
+
+		regmap_read(chip->regmap, 0x104, &type);
+		regmap_read(chip->regmap, 0x105, &subtype);
+		regmap_read(chip->regmap, 0x101, &rev2);
+		regmap_read(chip->regmap, 0x102, &rev3);
+		regmap_read(chip->regmap, 0x103, &rev4);
+		len += sysfs_emit_at(buf, len,
+				     "PMIC type=%#x subtype=%#x rev2=%#x rev3=%#x rev4=%#x\n",
+				     type, subtype, rev2, rev3, rev4);
+	}
 
 	for (i = 0; i < ARRAY_SIZE(p); i++) {
 		if (qcom_fg_gen4_sram_read(chip, p[i].word, 0, v, p[i].len)) {
@@ -668,6 +697,78 @@ static ssize_t profile_dump_show(struct device *dev,
 	return len;
 }
 static DEVICE_ATTR_RO(profile_dump);
+
+/*
+ * Nabu debug hook: write FULL_SOC (and the vendor's 0xFFFF "full" marker into
+ * MONOTONIC) from the current state of charge, i.e. pretend the pack is full
+ * now.  Used to test the hypothesis that the stretched high-SOC end of the
+ * curve is caused by FULL_SOC still holding its invalid power-on value.
+ */
+static ssize_t full_soc_mark_store(struct device *dev,
+				   struct device_attribute *attr,
+				   const char *buf, size_t count)
+{
+	struct qcom_fg_chip *chip = dev_get_drvdata(dev);
+	u8 full[2] = { 0xff, 0xff }, bsoc[2];
+	u32 cap = 0;
+	int rc, b;
+
+	if (kstrtou32(buf, 0, &cap) || cap > 100)
+		return -EINVAL;
+
+	b = cap * 100;			/* 0.01% units */
+	bsoc[0] = b & 0xff;
+	bsoc[1] = (b >> 8) & 0xff;
+
+	rc = qcom_fg_gen4_sram_write(chip, FG4_FULL_SOC_WORD, 0, bsoc, 2);
+	if (rc)
+		return rc;
+	rc = qcom_fg_gen4_sram_write(chip, FG4_MONOTONIC_SOC_WORD, 0, full, 2);
+	if (rc)
+		return rc;
+
+	dev_info(chip->dev, "FULL_SOC marked at %u%% (bsoc=%d)\n", cap, b);
+	return count;
+}
+static DEVICE_ATTR_WO(full_soc_mark);
+
+/* Restore the gauge's "invalid" FULL_SOC marker (0xFFFF), i.e. undo a
+ * full_soc_mark experiment. */
+static ssize_t full_soc_restore_store(struct device *dev,
+				      struct device_attribute *attr,
+				      const char *buf, size_t count)
+{
+	struct qcom_fg_chip *chip = dev_get_drvdata(dev);
+	u8 inv[2] = { 0xff, 0xff };
+	int rc;
+
+	rc = qcom_fg_gen4_sram_write(chip, FG4_FULL_SOC_WORD, 0, inv, 2);
+	if (rc)
+		return rc;
+	rc = qcom_fg_gen4_sram_write(chip, FG4_MONOTONIC_SOC_WORD, 0, inv, 2);
+	if (rc)
+		return rc;
+
+	dev_info(chip->dev, "FULL_SOC restored to invalid (0xFFFF)\n");
+	return count;
+}
+static DEVICE_ATTR_WO(full_soc_restore);
+
+/* Re-derive the state of charge from the current open-circuit voltage, the way
+ * the vendor driver does after loading a profile. */
+static ssize_t soc_restart_store(struct device *dev,
+				 struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	struct qcom_fg_chip *chip = dev_get_drvdata(dev);
+	int rc = qcom_fg_gen4_restart(chip);
+
+	if (rc)
+		return rc;
+	dev_info(chip->dev, "gauge SOC restarted\n");
+	return count;
+}
+static DEVICE_ATTR_WO(soc_restart);
 
 static int qcom_fg_get_capacity(struct qcom_fg_chip *chip, int *val)
 {
@@ -1799,9 +1900,37 @@ static int qcom_fg_gen4_seed_capacity(struct qcom_fg_chip *chip)
 	return ret;
 }
 
+/*
+ * Nabu: ESR pulse threshold, the one gauge parameter the vendor writes at init
+ * that we were still missing.  It sets the current step the gauge injects to
+ * measure the battery's internal resistance, and the ESR model is what
+ * compensates the IR drop when it maps voltage to state of charge - i.e. the
+ * high-SOC end of the curve, which is exactly where our reported charge still
+ * runs fast.
+ */
+static int qcom_fg_gen4_write_esr_thresh(struct qcom_fg_chip *chip)
+{
+	struct device_node *np = chip->dev->of_node;
+	u32 ma = FG4_ESR_PULSE_DEFAULT_MA;
+	u8 raw;
+
+	of_property_read_u32(np, "qcom,fg-esr-pulse-thresh-ma", &ma);
+	raw = DIV_ROUND_CLOSEST(ma * FG4_ESR_PULSE_NUMR, FG4_ESR_PULSE_DENR);
+	if (!raw)
+		raw = 1;
+
+	return qcom_fg_gen4_sram_write(chip, FG4_ESR_PULSE_THRESH_WORD,
+				       1, &raw, 1);
+}
+
 static int qcom_fg_gen4_configure(struct qcom_fg_chip *chip)
 {
 	int ret;
+
+	ret = qcom_fg_gen4_write_esr_thresh(chip);
+	if (ret)
+		dev_warn(chip->dev, "failed to write ESR pulse threshold: %d\n",
+			 ret);
 
 	ret = qcom_fg_gen4_seed_capacity(chip);
 	if (ret)
@@ -1901,6 +2030,12 @@ static int qcom_fg_probe(struct platform_device *pdev)
 		dev_warn(chip->dev, "no soc_params attribute\n");
 	if (device_create_file(chip->dev, &dev_attr_profile_dump))
 		dev_warn(chip->dev, "no profile_dump attribute\n");
+	if (device_create_file(chip->dev, &dev_attr_full_soc_mark))
+		dev_warn(chip->dev, "no full_soc_mark attribute\n");
+	if (device_create_file(chip->dev, &dev_attr_full_soc_restore))
+		dev_warn(chip->dev, "no full_soc_restore attribute\n");
+	if (device_create_file(chip->dev, &dev_attr_soc_restart))
+		dev_warn(chip->dev, "no soc_restart attribute\n");
 
 	ret = power_supply_get_battery_info(chip->batt_psy, &chip->batt_info);
 	if (ret) {
