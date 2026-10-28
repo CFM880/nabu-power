@@ -642,14 +642,28 @@ static void smb2_typec_set_mode(struct smb2_chip *chip, enum usb_role role)
 
 	if (chip->role_sw)
 		usb_role_switch_set_role(chip->role_sw, role);
+
+	/* host mode means we feed the port: turn the SMB5 boost on/off */
+	if (role == USB_ROLE_HOST && chip->otg_vbus) {
+		int rc = regulator_enable(chip->otg_vbus);
+
+		if (rc)
+			dev_warn(chip->dev, "OTG 5V on failed: %d\n", rc);
+	} else if (chip->otg_vbus) {
+		regulator_disable(chip->otg_vbus);
+	}
 }
 
 static void smb2_typec_apply_role(struct smb2_chip *chip, enum usb_role role)
 {
-	if (role == chip->typec_role)
-		return;
-
-	dev_info(chip->dev, "typec: role %d -> %d\n", chip->typec_role, role);
+	/*
+	 * Always apply, even when the cached role already matches: dwc3 can drop
+	 * a request (see below), and an early return here made "write host again"
+	 * a no-op, i.e. there was no way to retry a switch that did not take.
+	 */
+	if (role != chip->typec_role)
+		dev_info(chip->dev, "typec: role %d -> %d\n",
+			 chip->typec_role, role);
 
 	/*
 	 * NOTE: dwc3 drops the first role request after boot - the host

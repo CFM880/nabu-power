@@ -1,0 +1,50 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# nabu-typec - switch the Type-C port role on the Xiaomi Pad 5.
+#
+#   nabu-typec host      we become the host: 5V out, USB sticks / headsets /
+#                        keyboards work (charging is off while in this mode)
+#   nabu-typec device    back to being a device: charger and PC (default)
+#   nabu-typec auto      hand the role back to the driver (same as device here,
+#                        because CC detection is unimplemented)
+#   nabu-typec status    print what the port currently reports
+#
+# Needs root (the role attribute is root-owned):
+#   sudo nabu-typec host
+#
+# Why two writes for host/device: dwc3 drops the first role request after boot -
+# the host controller never appears even though the role switch reports success.
+# A second, spaced request sticks.  See KNOWN-ISSUES 2.6.0.
+
+set -eu
+
+ROLE=/sys/bus/platform/devices/c440000.spmi:pmic@2:charger@1000/typec_role
+USBN_V=/sys/bus/iio/devices/iio:device1/in_voltage_usbin_v_input
+UDC=/sys/class/udc/a600000.usb/state
+
+[ -e "$ROLE" ] || { echo "nabu-typec: $ROLE missing (gauge/charger driver not loaded?)" >&2; exit 1; }
+
+set_role() {
+	echo auto > "$ROLE"
+	sleep 3
+	echo "$1" > "$ROLE"
+	sleep 2
+}
+
+show() {
+	printf 'role:     %s\n' "$(cat "$ROLE")"
+	[ -r "$USBN_V" ] && printf 'port 5V:  %s uV\n' "$(cat "$USBN_V")"
+	[ -r "$UDC" ] && printf 'udc:      %s\n' "$(cat "$UDC")"
+	if command -v lsusb >/dev/null 2>&1; then
+		lsusb -t 2>/dev/null | sed -n '/Bus 003/,/^$/p' | sed 's/^/  /'
+	fi
+}
+
+case "${1:-status}" in
+host)   set_role host;   show ;;
+device) set_role device; show ;;
+auto)   echo auto > "$ROLE"; sleep 1; show ;;
+status) show ;;
+*)      echo "usage: $0 host|device|auto|status" >&2; exit 1 ;;
+esac

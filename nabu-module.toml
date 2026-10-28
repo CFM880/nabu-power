@@ -20,3 +20,4 @@ kernel_targets = ["drivers/power/supply/ln8000_charger.ko"]
 [install]
 "ln8000_charger.ko"                  = "/lib/modules/@release@/kernel/drivers/power/supply/ln8000_charger.ko"
 "systemd/ln8000-autoload.service"    = "/etc/systemd/system/ln8000-autoload.service"
+"bin/nabu-typec"                     = "/usr/local/bin/nabu-typec"
