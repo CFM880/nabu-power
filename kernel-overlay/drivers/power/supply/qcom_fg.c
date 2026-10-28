@@ -105,9 +105,17 @@
 #define FIRST_LOG_CURRENT_OFFSET	0
 #define PROFILE_LOAD_BIT		BIT(0)
 
-/* SRAM word of the learned "actual battery capacity" (vendor qpnp-fg-gen4:
- * ACT_BATT_CAP_WORD), 2 bytes little endian, unit mAh. */
-#define FG4_ACT_BATT_CAP_WORD		285
+/*
+ * SRAM words from the vendor's PM8150B **v2** parameter table
+ * (pm8150b_v2_sram_params; v1 is only used for PM8150B rev 1.0).  The v1 words
+ * (285/449/...) point at entirely different parameters on a v2 chip, which is
+ * what made the earlier capacity seed and SOC readouts meaningless.
+ */
+#define FG4_ACT_BATT_CAP_WORD		287	/* learned capacity, mAh */
+#define FG4_BATT_SOC_WORD		455	/* coulomb-counted SOC, 0.01% */
+#define FG4_FULL_SOC_WORD		461
+#define FG4_CC_SOC_WORD			466
+#define FG4_MONOTONIC_SOC_WORD		469
 #define HLOS_RESTART_BIT		BIT(3)
 
 #define CUTOFF_CURR_WORD		19
@@ -615,11 +623,11 @@ static ssize_t soc_params_show(struct device *dev,
 			       struct device_attribute *attr, char *buf)
 {
 	static const struct { const char *name; u16 word; int len; } p[] = {
-		{ "ACT_BATT_CAP", 285, 2 },	/* learned capacity */
-		{ "BATT_SOC",     449, 4 },
-		{ "FULL_SOC",     455, 2 },
-		{ "CC_SOC",       460, 4 },
-		{ "MONOTONIC",    463, 2 },
+		{ "ACT_BATT_CAP", FG4_ACT_BATT_CAP_WORD, 2 },
+		{ "BATT_SOC",     FG4_BATT_SOC_WORD,     4 },
+		{ "FULL_SOC",     FG4_FULL_SOC_WORD,     2 },
+		{ "CC_SOC",       FG4_CC_SOC_WORD,       4 },
+		{ "MONOTONIC",    FG4_MONOTONIC_SOC_WORD, 2 },
 	};
 	struct qcom_fg_chip *chip = dev_get_drvdata(dev);
 	int i, j, len = 0;
@@ -665,6 +673,28 @@ static int qcom_fg_get_capacity(struct qcom_fg_chip *chip, int *val)
 {
 	u8 cap[2];
 	int ret;
+
+	/*
+	 * Nabu: prefer the coulomb-counted SOC the vendor driver reports
+	 * (SRAM BATT_SOC, 0.01%), and only fall back to the monotonic register
+	 * below when that read is unavailable or out of range.  The monotonic
+	 * value is a smoothing aid - reporting it directly made the charge
+	 * advance about 2.3x faster than the charge actually moving.
+	 */
+	{
+		u8 raw[4] = {};
+		u32 bsoc;
+
+		ret = qcom_fg_gen4_sram_read(chip, FG4_BATT_SOC_WORD, 0, raw, 4);
+		if (!ret) {
+			bsoc = (u32)raw[0] | ((u32)raw[1] << 8) |
+			       ((u32)raw[2] << 16) | ((u32)raw[3] << 24);
+			if (bsoc <= 10000) {
+				*val = DIV_ROUND_CLOSEST(bsoc, 100);
+				return 0;
+			}
+		}
+	}
 
 	ret = qcom_fg_read(chip, cap, BATT_MONOTONIC_SOC, 2);
 	if (ret) {
