@@ -223,8 +223,15 @@
 #define TYPEC_TRYSINK_DETECT_STATUS_BIT			BIT(0)
 
 #define CMD_APSD					0x341
-#define ICL_OVERRIDE_BIT				BIT(1)
 #define APSD_RERUN_BIT					BIT(0)
+/*
+ * Software ICL override.  With the hardware in auto mode the input limit
+ * follows the APSD/BC1.2 result, i.e. a misdetected adapter is clamped to the
+ * 500mA USB default no matter what USBIN_CURRENT_LIMIT says.  The vendor
+ * switches to "high current" mode whenever it programmes more than 500mA.
+ */
+#define CMD_ICL_OVERRIDE				0x342
+#define ICL_OVERRIDE_CMD_BIT				BIT(0)
 
 #define TYPE_C_CFG					0x358
 #define APSD_START_ON_CC_BIT				BIT(7)
@@ -294,11 +301,13 @@
 #define USBIN_SUSPEND_BIT				BIT(0)
 
 #define USBIN_ADAPTER_ALLOW_CFG				0x360
+#define USBIN_ADAPTER_ALLOW_5V				0
 #define USBIN_ADAPTER_ALLOW_5V_OR_9V			3
 #define USBIN_ADAPTER_ALLOW_5V_TO_12V			12
 
 #define CMD_HVDCP_2					0x343
 #define HVDCP_FORCE_9V_BIT				BIT(4)
+#define HVDCP_FORCE_5V_BIT				BIT(3)
 
 /*
  * Nabu: the SMB5 Type-C block lives at its own base (0x1500), not in the
@@ -635,10 +644,18 @@ static void smb2_typec_init(struct smb2_chip *chip)
 				DFP_EN_CMD_BIT | UFP_EN_CMD_BIT);
 	dev_info(chip->dev, "typec init: drp write rc=%d\n", rc);
 
-	/* run APSD as soon as CC detects a partner (charger classification) */
+	/*
+	 * BC1.2 (APSD) has to start on VBUS alone, not only once the Type-C
+	 * block reports a CC attach.  With BC1P2_START_ON_CC set an adapter
+	 * that VBUS is present for but whose CC is not detected (this board's
+	 * Type-C block frequently does not see it) never runs APSD at all, so
+	 * it stays unclassified and the input limit stays at the 500mA USB
+	 * default - which shows up as "plugged in but not charging".  The
+	 * vendor clears this bit for exactly that reason.
+	 */
 	rc = regmap_update_bits(chip->regmap, chip->base + TYPE_C_CFG,
-				APSD_START_ON_CC_BIT, APSD_START_ON_CC_BIT);
-	dev_info(chip->dev, "typec init: apsd write rc=%d\n", rc);
+				APSD_START_ON_CC_BIT, 0);
+	dev_info(chip->dev, "typec init: apsd-on-vbus rc=%d\n", rc);
 
 	msleep(50);
 	rc = regmap_read(chip->regmap, chip->base + TYPE_C_INTRPT_ENB_SOFTWARE_CTRL,
@@ -807,6 +824,33 @@ static ssize_t typec_regs_show(struct device *dev,
 		len += sysfs_emit_at(buf, len, "%-15s %#04x = %#04x\n",
 				     "OTG_CFG", chip->base + SMB5_DCDC_OTG_CFG, v);
 
+	/* adapter detection / charge path, for debugging "not charging" */
+	{
+		static const struct { const char *name; u16 reg; } c[] = {
+			{ "APSD_STATUS",   APSD_STATUS },
+			{ "APSD_RESULT",   APSD_RESULT_STATUS },
+			{ "CMD_APSD",      CMD_APSD },
+			{ "CHG_EN_CMD",    CHARGING_ENABLE_CMD },
+			{ "USBIN_OPT_1",   USBIN_OPTIONS_1_CFG },
+			{ "USBIN_OPT_2",   USBIN_OPTIONS_2_CFG },
+			{ "USBIN_ILIM",    USBIN_CURRENT_LIMIT_CFG },
+			{ "USBIN_LOAD",    USBIN_LOAD_CFG },
+			{ "USBIN_ICL_OPT", USBIN_ICL_OPTIONS },
+			{ "CMD_ICL_OVR",   CMD_ICL_OVERRIDE },
+			{ "BATT_CHG_STS",  BATTERY_CHARGER_STATUS_1 },
+			{ "BATT_CHG_STS2", BATTERY_CHARGER_STATUS_2 },
+			{ "JEITA_EN",      JEITA_EN_CFG },
+		};
+		int j;
+
+		for (j = 0; j < ARRAY_SIZE(c); j++) {
+			if (regmap_read(chip->regmap, chip->base + c[j].reg, &v))
+				continue;
+			len += sysfs_emit_at(buf, len, "%-15s %#04x = %#04x\n",
+					     c[j].name, chip->base + c[j].reg, v);
+		}
+	}
+
 	return len;
 }
 static DEVICE_ATTR_RO(typec_regs);
@@ -894,9 +938,15 @@ static void smb2_typec_poll(struct work_struct *work)
 		 * the charging state would flip-flop).  This also filters the
 		 * dual-role rotation, where the port can misread the same charger
 		 * as a sink for a moment.
+		 *
+		 * Stay in dual role rather than pinning the port to sink: the
+		 * Type-C block has to keep its own CC state machine running for
+		 * APSD to classify the adapter, and pinning it to sink made a PD
+		 * charger come up as a plain 500mA SDP source (measured:
+		 * current_max 500000 with the battery net discharging).
 		 */
 		role = USB_ROLE_DEVICE;
-		mode = USB_ROLE_DEVICE;
+		mode = USB_ROLE_NONE;
 		chip->typec_host_votes = 0;
 	} else if (chip->typec_role == USB_ROLE_HOST) {
 		/*
@@ -929,9 +979,12 @@ static void smb2_typec_poll(struct work_struct *work)
 		mode = USB_ROLE_HOST;
 		chip->typec_lost_votes = 0;
 	} else if (attached) {
-		/* attached, but we are the UFP: a charger or a PC */
+		/*
+		 * Attached, but we are the UFP: a charger or a PC.  Dual role
+		 * again, for the same reason as above.
+		 */
 		role = USB_ROLE_DEVICE;
-		mode = USB_ROLE_DEVICE;
+		mode = USB_ROLE_NONE;
 		chip->typec_host_votes = 0;
 	} else {
 		/* nothing attached: stay in dual role so devices are visible */
@@ -1140,6 +1193,7 @@ static inline int smb2_get_current_limit(struct smb2_chip *chip,
 static int smb2_set_current_limit(struct smb2_chip *chip, unsigned int val)
 {
 	unsigned char val_raw;
+	int rc;
 
 	if (val > chip->curr_max_ua) {
 		dev_err(chip->dev,
@@ -1149,8 +1203,45 @@ static int smb2_set_current_limit(struct smb2_chip *chip, unsigned int val)
 	}
 	val_raw = val / chip->curr_scale;
 
-	return regmap_write(chip->regmap, chip->base + USBIN_CURRENT_LIMIT_CFG,
-			    val_raw);
+	rc = regmap_write(chip->regmap, chip->base + USBIN_CURRENT_LIMIT_CFG,
+			  val_raw);
+	if (rc)
+		return rc;
+
+	if (!chip->is_smb5)
+		return 0;
+
+	/* Keep the USBIN on the charge path rather than the 5V/500mA one. */
+	rc = regmap_update_bits(chip->regmap, chip->base + USBIN_ICL_OPTIONS,
+				USB51_MODE_BIT | USBIN_MODE_CHG_BIT,
+				USBIN_MODE_CHG_BIT);
+	if (rc)
+		return rc;
+
+	if (val > 500000) {
+		/*
+		 * High-current mode: honour the value above instead of the
+		 * APSD result.  Without this the adapter stays clamped to the
+		 * USB default and the tablet only trickle-charges even though
+		 * APSD already classified it as DCP.
+		 */
+		rc = regmap_update_bits(chip->regmap,
+					chip->base + USBIN_LOAD_CFG,
+					ICL_OVERRIDE_AFTER_APSD_BIT,
+					ICL_OVERRIDE_AFTER_APSD_BIT);
+		if (rc)
+			return rc;
+		rc = regmap_update_bits(chip->regmap,
+					chip->base + CMD_ICL_OVERRIDE,
+					ICL_OVERRIDE_CMD_BIT, 0);
+	} else {
+		/* Back to hardware auto for the low-current cases. */
+		rc = regmap_update_bits(chip->regmap,
+					chip->base + USBIN_LOAD_CFG,
+					ICL_OVERRIDE_AFTER_APSD_BIT, 0);
+	}
+
+	return rc;
 }
 
 static void smb2_status_change_work(struct work_struct *work)
@@ -1208,7 +1299,12 @@ static void smb2_status_change_work(struct work_struct *work)
 		regulator_disable(chip->dpdm_reg);
 
 	if (rc == -EAGAIN) {
-		dev_dbg(chip->dev, "apsd not ready, will retry\n");
+		unsigned int apsd = 0;
+
+		regmap_read(chip->regmap, chip->base + APSD_STATUS, &apsd);
+		if (chip->apsd_retries == 0)
+			dev_info(chip->dev, "apsd not ready: status=%#x\n",
+				 apsd);
 		if (chip->is_smb5 &&
 		    chip->apsd_retries < SMB2_APSD_MAX_RETRIES) {
 			chip->apsd_retries++;
@@ -1247,16 +1343,13 @@ static void smb2_status_change_work(struct work_struct *work)
 		 charger_type == POWER_SUPPLY_USB_TYPE_SDP ? "SDP" : "unknown",
 		 current_ua);
 
-	if (chip->is_smb5 &&
-	    (charger_type == POWER_SUPPLY_USB_TYPE_DCP ||
-	     charger_type == POWER_SUPPLY_USB_TYPE_CDP)) {
-		/* Deterministically ask a QC adapter for 9V. A non-QC
-		 * adapter ignores the request and stays at 5V. */
-		rc = regmap_update_bits(chip->regmap, chip->base + CMD_HVDCP_2,
-					HVDCP_FORCE_9V_BIT, HVDCP_FORCE_9V_BIT);
-		if (rc < 0)
-			dev_warn(chip->dev, "failed to force 9V: %d\n", rc);
-	}
+	/*
+	 * Do NOT ask a QC adapter for 9V.  On nabu the high-voltage path is the
+	 * LN8000 charge pump, which needs its own regulation loop; without it
+	 * the port is left at 9.6V with the input limit collapsed to 100mA and
+	 * the battery discharging (measured), while 5V charges fine.  Stay at
+	 * 5V until the pump path is wired up.
+	 */
 
 	/* SMB5: an adapter that was already attached at boot can be
 	 * mis-classified as SDP before D+/D- settle. Retry so the QC/HVDCP
@@ -1790,22 +1883,31 @@ static int smb2_init_hw(struct smb2_chip *chip)
 					HVDCP_AUTH_ALG_EN_CFG_BIT |
 					HVDCP_EN_BIT |
 					HVDCP_AUTONOMOUS_MODE_EN_CFG_BIT,
-					AUTO_SRC_DETECT_BIT |
-					HVDCP_AUTH_ALG_EN_CFG_BIT |
-					HVDCP_EN_BIT |
-					HVDCP_AUTONOMOUS_MODE_EN_CFG_BIT);
+					AUTO_SRC_DETECT_BIT);
 		if (rc < 0)
 			return dev_err_probe(chip->dev, rc,
-					     "failed to enable APSD/HVDCP\n");
+					     "failed to enable BC1.2\n");
 
-		/* Allow the adapter to raise VBUS to 9V (QC2, stable) so the
-		 * LN8000 charge pump can also run. */
+		/*
+		 * Stay at 5V.  High voltage belongs to the LN8000 charge pump
+		 * and to its own regulation loop; with only the SMB5 running,
+		 * a QC adapter that has been asked for 9V leaves the port at
+		 * ~10V with the input limit collapsed to 100mA and the battery
+		 * discharging, while 5V charges normally.
+		 */
 		rc = regmap_write(chip->regmap,
 				  chip->base + USBIN_ADAPTER_ALLOW_CFG,
-				  USBIN_ADAPTER_ALLOW_5V_OR_9V);
+				  USBIN_ADAPTER_ALLOW_5V);
 		if (rc < 0)
 			return dev_err_probe(chip->dev, rc,
 					     "failed to set adapter allowance\n");
+
+		/* And drop an adapter that latched a higher voltage earlier. */
+		rc = regmap_write(chip->regmap, chip->base + CMD_HVDCP_2,
+				  HVDCP_FORCE_5V_BIT);
+		if (rc < 0)
+			return dev_err_probe(chip->dev, rc,
+					     "failed to force 5V\n");
 
 		/*
 		 * Nabu: while idle the Type-C block parks in the sink phase, so a
