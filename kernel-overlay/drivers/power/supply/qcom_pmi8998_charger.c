@@ -200,6 +200,8 @@
  * SoC out of s2idle for no reason.
  */
 #define SMB2_TYPEC_POLL_MS				30000
+/* while a decision is pending (votes, settle, hold) poll quickly instead */
+#define SMB2_TYPEC_POLL_MS_BUSY				1000
 #define TRY_SOURCE_FAILED_BIT				BIT(6)
 #define TRY_SINK_FAILED_BIT				BIT(5)
 #define TIMER_STAGE_2_BIT				BIT(4)
@@ -810,6 +812,7 @@ static void smb2_typec_poll(struct work_struct *work)
 	unsigned int misc = 0;
 	bool attached, we_are_source;
 	enum usb_role role, mode;
+	bool changed = false;
 	int online = 0;
 
 	if (!chip->role_sw) {
@@ -833,8 +836,9 @@ static void smb2_typec_poll(struct work_struct *work)
 	attached = !!(misc & TYPEC_CC_ATTACHED);
 	we_are_source = !!(misc & TYPEC_SNK_SRC_MODE);
 
-	if (attached != chip->typec_attached ||
-	    we_are_source != chip->typec_dfp) {
+	changed = attached != chip->typec_attached ||
+		  we_are_source != chip->typec_dfp;
+	if (changed) {
 		/*
 		 * debug level on purpose: while the port rotates in dual role it
 		 * flips we_are_source every couple of seconds with nothing
@@ -936,9 +940,20 @@ apply:
 	}
 
 out:
-	if (chip->typec_force == USB_ROLE_NONE)
-		schedule_delayed_work(&chip->typec_work,
-				      msecs_to_jiffies(SMB2_TYPEC_POLL_MS));
+	if (chip->typec_force == USB_ROLE_NONE) {
+		/*
+		 * While the sink hold is running the port is pinned to sink, so it
+		 * cannot see a device; poll quickly until it expires and the port
+		 * goes back to dual role, then fall back to the long safety net.
+		 */
+		bool busy = chip->typec_sink_hold || chip->typec_host_votes > 0 ||
+			    changed || chip->typec_settle;
+		unsigned long delay = busy ?
+				       msecs_to_jiffies(SMB2_TYPEC_POLL_MS_BUSY) :
+				       msecs_to_jiffies(SMB2_TYPEC_POLL_MS);
+
+		schedule_delayed_work(&chip->typec_work, delay);
+	}
 }
 
 static const unsigned int smb2_usb_extcon_cables[] = {
