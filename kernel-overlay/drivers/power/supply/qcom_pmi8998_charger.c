@@ -832,10 +832,15 @@ static void smb2_typec_poll(struct work_struct *work)
 
 	if (attached != chip->typec_attached ||
 	    we_are_source != chip->typec_dfp) {
-		dev_info(chip->dev,
-			 "typec: attached=%d we_are_source=%d orientation=%d (misc=%#x)\n",
-			 attached, we_are_source,
-			 !!(misc & TYPEC_CC_ORIENTATION), misc);
+		/*
+		 * debug level on purpose: while the port rotates in dual role it
+		 * flips we_are_source every couple of seconds with nothing
+		 * attached, and that is not something anyone needs in dmesg.
+		 */
+		dev_dbg(chip->dev,
+			"typec: attached=%d we_are_source=%d orientation=%d (misc=%#x)\n",
+			attached, we_are_source,
+			!!(misc & TYPEC_CC_ORIENTATION), misc);
 		chip->typec_attached = attached;
 		chip->typec_dfp = we_are_source;
 	}
