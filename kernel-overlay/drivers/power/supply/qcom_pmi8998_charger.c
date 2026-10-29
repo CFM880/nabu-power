@@ -335,6 +335,13 @@
 /* TYPE_C_MISC_STATUS (0x150B) */
 #define TYPEC_CC_ATTACHED			BIT(0)
 #define TYPEC_CC_ORIENTATION			BIT(1)
+/*
+ * Set once the CC debounce has completed, i.e. a partner is on the port.  In
+ * source-only mode the block does NOT set CC_ATTACHED for a sink (a headset
+ * enumerates and works with attached=0), so this bit is the only usable
+ * "something is still plugged in" signal while we are the host.
+ */
+#define TYPEC_TCCDEBOUNCE_DONE			BIT(3)
 #define TYPEC_SNK_SRC_MODE			BIT(6)
 #define TYPEC_TRY_SRC				BIT(3)
 
@@ -884,7 +891,7 @@ static void smb2_typec_poll(struct work_struct *work)
 	struct smb2_chip *chip =
 		container_of(work, struct smb2_chip, typec_work.work);
 	unsigned int misc = 0;
-	bool attached, we_are_source;
+	bool attached, present, we_are_source;
 	enum usb_role role, mode;
 	bool changed = false;
 	int online = 0;
@@ -908,6 +915,7 @@ static void smb2_typec_poll(struct work_struct *work)
 		goto out;
 
 	attached = !!(misc & TYPEC_CC_ATTACHED);
+	present = attached || !!(misc & TYPEC_TCCDEBOUNCE_DONE);
 	we_are_source = !!(misc & TYPEC_SNK_SRC_MODE);
 
 	changed = attached != chip->typec_attached ||
@@ -919,8 +927,8 @@ static void smb2_typec_poll(struct work_struct *work)
 		 * attached, and that is not something anyone needs in dmesg.
 		 */
 		dev_dbg(chip->dev,
-			"typec: attached=%d we_are_source=%d orientation=%d (misc=%#x)\n",
-			attached, we_are_source,
+			"typec: attached=%d present=%d we_are_source=%d orientation=%d (misc=%#x)\n",
+			attached, present, we_are_source,
 			!!(misc & TYPEC_CC_ORIENTATION), misc);
 		chip->typec_attached = attached;
 		chip->typec_dfp = we_are_source;
@@ -968,7 +976,7 @@ static void smb2_typec_poll(struct work_struct *work)
 		 * headset drop off (the CC status blips to "no attach" now and
 		 * then even though the device is still there).
 		 */
-		if (attached) {
+		if (present) {
 			chip->typec_lost_votes = 0;
 			goto out;		/* still there: keep hosting */
 		}
