@@ -1775,6 +1775,20 @@ static int smb2_init_hw(struct smb2_chip *chip)
 			return dev_err_probe(chip->dev, rc,
 					     "failed to set adapter allowance\n");
 
+		/*
+		 * Nabu: while idle the Type-C block parks in the sink phase, so a
+		 * plugged sink (stick, headset) is only noticed when it next tries
+		 * the source phase.  Ask for the shorter dual-role DFP window so
+		 * that probe comes around sooner.
+		 */
+		rc = regmap_update_bits(chip->regmap,
+					chip->base + TAPER_TIMER_SEL_CFG,
+					TYPEC_DRP_DFP_TIME_CFG_BIT,
+					TYPEC_DRP_DFP_TIME_CFG_BIT);
+		if (rc)
+			dev_warn(chip->dev, "failed to set DRP DFP time: %d\n",
+				 rc);
+
 		/* Re-run APSD so an adapter that was already attached before
 		 * HVDCP was enabled is re-classified and the QC handshake is
 		 * performed at boot. */
