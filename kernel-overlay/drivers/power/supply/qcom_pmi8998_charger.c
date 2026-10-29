@@ -507,6 +507,8 @@ struct smb2_chip {
 	int typec_settle;	/* extra applies: dwc3 drops the first request */
 	/* polls to stay sink-only after leaving host mode (see below) */
 	int typec_sink_hold;
+	/* consecutive polls that wanted host, to filter dual-role transients */
+	int typec_host_votes;
 	int typec_mode;		/* last Type-C mode written, -1 = none yet */
 	/* 0 = follow CC detection, otherwise force host/device */
 	enum usb_role typec_force;
@@ -808,6 +810,7 @@ static void smb2_typec_poll(struct work_struct *work)
 	unsigned int misc = 0;
 	bool attached, we_are_source;
 	enum usb_role role, mode;
+	int online = 0;
 
 	if (!chip->role_sw) {
 		chip->role_sw = usb_role_switch_get(chip->dev);
@@ -856,9 +859,22 @@ static void smb2_typec_poll(struct work_struct *work)
 	 * pinning the port to sink whenever it is idle would make devices
 	 * invisible forever - which is exactly what happened before.
 	 */
+	smb2_get_prop_usb_online(chip, &online);
+
 	if (chip->typec_force != USB_ROLE_NONE) {
 		role = chip->typec_force;
 		mode = role;
+	} else if (online) {
+		/*
+		 * Somebody is feeding VBUS - a charger or a PC.  Never act as the
+		 * host then: doing so would drive our own 5V into the charger (and
+		 * the charging state would flip-flop).  This also filters the
+		 * dual-role rotation, where the port can misread the same charger
+		 * as a sink for a moment.
+		 */
+		role = USB_ROLE_DEVICE;
+		mode = USB_ROLE_DEVICE;
+		chip->typec_host_votes = 0;
 	} else if (!attached) {
 		role = USB_ROLE_DEVICE;		/* gadget ready for a PC */
 		/*
@@ -872,13 +888,24 @@ static void smb2_typec_poll(struct work_struct *work)
 		if (chip->typec_sink_hold)
 			chip->typec_sink_hold--;
 	} else if (we_are_source) {
+		/*
+		 * Require the same reading twice before turning the port around:
+		 * a single sample during the dual-role rotation is not enough.
+		 */
+		if (++chip->typec_host_votes < 2) {
+			role = chip->typec_role;
+			mode = chip->typec_mode;
+			goto apply;
+		}
 		role = USB_ROLE_HOST;
 		mode = USB_ROLE_HOST;
 	} else {
+		chip->typec_host_votes = 0;
 		role = USB_ROLE_DEVICE;
 		mode = USB_ROLE_DEVICE;
 	}
 
+apply:
 	if ((int)mode != chip->typec_mode) {
 		smb2_typec_set_mode(chip, mode);
 		chip->typec_mode = (int)mode;
