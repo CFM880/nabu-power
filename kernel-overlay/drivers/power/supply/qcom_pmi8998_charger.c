@@ -773,6 +773,17 @@ static ssize_t typec_role_store(struct device *dev,
 		return -EINVAL;
 
 	chip->typec_force = role;
+
+	/*
+	 * A forced role also has to program the Type-C block: without this
+	 * "host" only moved the USB role and switched the boost on while the
+	 * port stayed in dual role, so an attached device never saw Rp and the
+	 * port had to be bounced through "auto" first.
+	 */
+	if (role != USB_ROLE_NONE && role != chip->typec_mode) {
+		smb2_typec_set_mode(chip, role);
+		chip->typec_mode = role;
+	}
 	smb2_typec_apply_role(chip, role);
 
 	if (role == USB_ROLE_NONE)	/* "auto": start polling CC */
@@ -957,12 +968,18 @@ static void smb2_typec_poll(struct work_struct *work)
 		 * headset drop off (the CC status blips to "no attach" now and
 		 * then even though the device is still there).
 		 */
-		if (attached)
+		if (attached) {
 			chip->typec_lost_votes = 0;
-		else if (++chip->typec_lost_votes < 5)
-			goto out;
-		role = USB_ROLE_HOST;
-		mode = USB_ROLE_HOST;
+			goto out;		/* still there: keep hosting */
+		}
+		if (++chip->typec_lost_votes < 5)
+			goto out;		/* a CC blip, not a detach */
+
+		/* Really gone: drop the boost and go back to dual role, so a
+		 * charger plugged in next is detected normally. */
+		chip->typec_lost_votes = 0;
+		role = USB_ROLE_DEVICE;
+		mode = USB_ROLE_NONE;
 	} else if (attached && we_are_source) {
 		/*
 		 * A sink is on the port (stick, headset, keyboard): we have to be
