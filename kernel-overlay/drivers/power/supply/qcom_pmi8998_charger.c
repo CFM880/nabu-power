@@ -193,9 +193,13 @@
 
 #define TYPE_C_STATUS_5					0x30F
 
-/* Polling CC keeps the SoC from staying in its deepest s2idle state, so it is
- * opt-in: only "auto" in typec_role starts it. */
-#define SMB2_TYPEC_POLL_MS				2000
+/*
+ * Nabu: the Type-C role is event driven - the attach/detach and CC interrupts
+ * schedule the decision work immediately.  This interval is only a safety net
+ * in case an interrupt is missed, so keep it long: a short poll would wake the
+ * SoC out of s2idle for no reason.
+ */
+#define SMB2_TYPEC_POLL_MS				30000
 #define TRY_SOURCE_FAILED_BIT				BIT(6)
 #define TRY_SINK_FAILED_BIT				BIT(5)
 #define TIMER_STAGE_2_BIT				BIT(4)
@@ -501,6 +505,8 @@ struct smb2_chip {
 	bool role_sw_reported;
 	int typec_dbg_left;
 	int typec_settle;	/* extra applies: dwc3 drops the first request */
+	/* polls to stay sink-only after leaving host mode (see below) */
+	int typec_sink_hold;
 	int typec_mode;		/* last Type-C mode written, -1 = none yet */
 	/* 0 = follow CC detection, otherwise force host/device */
 	enum usb_role typec_force;
@@ -850,7 +856,16 @@ static void smb2_typec_poll(struct work_struct *work)
 		mode = role;
 	} else if (!attached) {
 		role = USB_ROLE_DEVICE;		/* gadget ready for a PC */
-		mode = USB_ROLE_NONE;		/* but the port stays DRP */
+		/*
+		 * Right after a device was unplugged the user usually plugs a
+		 * charger; while the port is in dual role it only sees that
+		 * charger during its sink phase (2-4 s).  Pin the port to sink
+		 * for a few polls so that common swap is instant, then go back
+		 * to dual role so devices stay detectable.
+		 */
+		mode = chip->typec_sink_hold ? USB_ROLE_DEVICE : USB_ROLE_NONE;
+		if (chip->typec_sink_hold)
+			chip->typec_sink_hold--;
 	} else if (we_are_source) {
 		role = USB_ROLE_HOST;
 		mode = USB_ROLE_HOST;
@@ -881,6 +896,7 @@ static void smb2_typec_poll(struct work_struct *work)
 		 * classification ourselves.
 		 */
 		if (prev == USB_ROLE_HOST && role != USB_ROLE_HOST) {
+			chip->typec_sink_hold = 3;	/* ~6 s of sink-only */
 			chip->apsd_retries = 0;
 			schedule_delayed_work(&chip->status_change_work,
 					      msecs_to_jiffies(200));
