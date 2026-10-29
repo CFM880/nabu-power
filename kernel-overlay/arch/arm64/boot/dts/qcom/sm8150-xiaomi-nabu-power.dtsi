@@ -21,14 +21,25 @@
 			compatible = "qcom,pm8150b-charger";
 			reg = <0x1000>;
 
+			/*
+			 * The last two come from the charger's own Type-C block
+			 * (slave 2, peripheral 0x15): attach/detach and CC state.
+			 * Without them a role change can only be noticed by
+			 * polling, which leaves the port blind for seconds after
+			 * a plug.
+			 */
 			interrupts = <0x2 0x13 0x4 IRQ_TYPE_EDGE_BOTH>,
 				     <0x2 0x12 0x2 IRQ_TYPE_EDGE_BOTH>,
 				     <0x2 0x16 0x1 IRQ_TYPE_EDGE_RISING>,
-				     <0x2 0x13 0x7 IRQ_TYPE_EDGE_RISING>;
+				     <0x2 0x13 0x7 IRQ_TYPE_EDGE_RISING>,
+				     <0x2 0x15 0x05 IRQ_TYPE_EDGE_BOTH>,
+				     <0x2 0x15 0x02 IRQ_TYPE_EDGE_BOTH>;
 			interrupt-names = "usb-plugin",
 					  "bat-ov",
 					  "wdog-bark",
-					  "usbin-icl-change";
+					  "usbin-icl-change",
+					  "typec-attach",
+					  "typec-cc";
 
 			io-channels = <&pm8150b_adc ADC5_USB_IN_I>,
 				      <&pm8150b_adc ADC5_USB_IN_V_16>;
@@ -46,6 +57,7 @@
 			 * mode (xHCI reports "port power" but never "connect").
 			 */
 			dpdm-supply = <&usb_1_hsphy>;
+
 
 
 			/* dpdm-supply is set further down (it needs the PHY

@@ -1436,6 +1436,20 @@ static irqreturn_t smb2_handle_batt_overvoltage(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
+/*
+ * Nabu: the Type-C block raises an interrupt on attach/detach and CC changes.
+ * React to it immediately instead of waiting for the next 2 s poll - polling
+ * alone left the port blind for several seconds after a plug.
+ */
+static irqreturn_t smb2_handle_typec_irq(int irq, void *data)
+{
+	struct smb2_chip *chip = data;
+
+	schedule_delayed_work(&chip->typec_work, 0);
+
+	return IRQ_HANDLED;
+}
+
 static irqreturn_t smb2_handle_usb_plugin(int irq, void *data)
 {
 	struct smb2_chip *chip = data;
@@ -2112,6 +2126,20 @@ static int smb2_probe(struct platform_device *pdev)
 		}
 		/* start the automatic role poll */
 		schedule_delayed_work(&chip->typec_work, 0);
+
+		/* and react to attach/CC interrupts without waiting for it */
+		for (unsigned int tci = 0; tci < 2; tci++) {
+			static const char * const names[] = {
+				"typec-attach", "typec-cc"
+			};
+			int irq = platform_get_irq_byname_optional(pdev,
+								   names[tci]);
+
+			if (irq > 0)
+				devm_request_threaded_irq(chip->dev, irq, NULL,
+					smb2_handle_typec_irq,
+					IRQF_ONESHOT, names[tci], chip);
+		}
 	}
 
 	/* Initialise charger state */
