@@ -249,6 +249,13 @@
 	#extcon-cells = <0>;
 	/* the dwc3 role switch this driver drives (see smb2_typec_poll) */
 	usb-role-switch = <&usb_1_dwc3>;
+	/*
+	 * The 5V boost for host mode.  The charger driver enables this when it
+	 * turns the port around, so the PM8150B VBUS regulator has exactly one
+	 * owner (a second one made the regulator core disable VBUS ~30s into
+	 * every boot, disconnecting whatever was plugged in).
+	 */
+	usb-vbus-supply = <&pm8150b_vbus>;
 };
 
 /*
@@ -259,4 +266,14 @@
  */
 &pm8150b_typec {
 	status = "disabled";
+};
+
+/*
+ * The VBUS regulator needs current limits in the DT, otherwise the regulator
+ * core rejects set_current_limit() ("current operation not allowed") and the
+ * boost keeps its 500mA reset value - too little for a stick or a dock.
+ */
+&pm8150b_vbus {
+	regulator-min-microamp = <500000>;
+	regulator-max-microamp = <3000000>;
 };

@@ -550,7 +550,6 @@ struct smb2_chip {
 	enum usb_role typec_role;
 	struct regulator *dpdm_reg;
 	/* Nabu: SMB5 5V boost for the Type-C port in host mode. */
-	struct regulator_dev *otg_rdev;
 
 	/* Per-PMIC register scaling. SMB2 uses 25mA/7.5mV steps, SMB5 (PM8150B)
 	 * uses 50mA/10mV steps and is configured by the Type-C driver instead. */
@@ -670,6 +669,9 @@ static void smb2_typec_init(struct smb2_chip *chip)
 	dev_info(chip->dev, "typec init: ctrl=%#x (rc=%d)\n", ctrl, rc);
 }
 
+static int smb2_otg_enable(struct smb2_chip *chip);
+static void smb2_otg_disable(struct smb2_chip *chip);
+
 /*
  * Nabu: apply a Type-C role (host needs the SMB5 5V boost).
  */
@@ -731,15 +733,11 @@ static void smb2_typec_apply_role(struct smb2_chip *chip, enum usb_role role)
 	 * unbalanced disables, and a disable it did not expect can cut VBUS
 	 * under a device that is still attached.
 	 */
-	if (role != chip->typec_role && chip->otg_vbus) {
-		if (role == USB_ROLE_HOST) {
-			int rc = regulator_enable(chip->otg_vbus);
-
-			if (rc)
-				dev_warn(chip->dev, "OTG 5V on failed: %d\n", rc);
-		} else {
-			regulator_disable(chip->otg_vbus);
-		}
+	if (role != chip->typec_role) {
+		if (role == USB_ROLE_HOST)
+			smb2_otg_enable(chip);
+		else
+			smb2_otg_disable(chip);
 	}
 
 	chip->typec_role = role;
@@ -1057,7 +1055,15 @@ out:
 		 */
 		bool busy = chip->typec_host_votes > 0 ||
 			    chip->typec_lost_votes > 0 ||
-			    changed || chip->typec_settle;
+			    changed || chip->typec_settle ||
+			    /*
+			     * A sink is on the port but VBUS still reads
+			     * present (it decays for a moment after a charger is
+			     * pulled).  Keep looking closely so host mode is
+			     * entered as soon as VBUS really is gone, instead of
+			     * sitting blind for the 30s safety-net period.
+			     */
+			    (attached && we_are_source);
 		unsigned long delay = busy ?
 				       msecs_to_jiffies(SMB2_TYPEC_POLL_MS_BUSY) :
 				       msecs_to_jiffies(SMB2_TYPEC_POLL_MS);
@@ -1675,6 +1681,12 @@ static irqreturn_t smb2_handle_usb_plugin(int irq, void *data)
 
 	schedule_delayed_work(&chip->status_change_work,
 			      msecs_to_jiffies(1500));
+	/*
+	 * A charger being unplugged is also the moment a device may appear on
+	 * the port: re-evaluate the role now instead of waiting for the idle
+	 * re-arm (which is 30s once things are stable).
+	 */
+	schedule_delayed_work(&chip->typec_work, 0);
 
 	return IRQ_HANDLED;
 }
@@ -2078,85 +2090,38 @@ static int smb2_init_irq(struct smb2_chip *chip, int *irq, const char *name,
 }
 
 /*
- * Nabu: SMB5 OTG boost, i.e. 5V out on the Type-C port so it can act as a USB
- * host (sticks, headsets, keyboards).  Only the DCDC bits are touched:
+ * Nabu: 5V out on the Type-C port so it can act as a USB host (sticks,
+ * headsets, keyboards).
  *
- *   0x153 OTG_EN_SRC_CFG = BIT(1)  - OTG enable follows the command bit
- *   0x140 OTG_EN         = BIT(0)  - boost on/off
- *
- * The current limit keeps its reset value.  Offsets are relative to CHGR_BASE,
- * so 0x1140 / 0x1153 on PM8150B.
+ * The boost itself is the PM8150B VBUS regulator (drivers/regulator/
+ * qcom_usb_vbus-regulator.c, "usb_vbus"), which owns DCDC_CMD_OTG/OTG_CFG.
+ * This driver must NOT poke those registers itself: registering a second
+ * regulator on the same hardware left the real one with use_count 0 and still
+ * switched on, so regulator_late_cleanup() turned VBUS off ~30s into every boot
+ * - the attached device simply disconnected and host mode appeared to hang.
  */
-
-
-static int smb2_otg_enable(struct regulator_dev *rdev)
+static int smb2_otg_enable(struct smb2_chip *chip)
 {
-	struct smb2_chip *chip = rdev_get_drvdata(rdev);
 	int rc;
 
-	/*
-	 * OTG_EN_SRC = 0: the boost follows the DCDC_CMD bit below, i.e. it is
-	 * under our control.  Leaving it at 1 hands the boost to the Type-C
-	 * block, whose CC state machine drops back to "no attach" now and then
-	 * even with a device plugged in - VBUS then disappears under the
-	 * device and it disconnects a second after enumerating.  The vendor
-	 * driver also configures VBUS "for software control" (writes 0 here).
-	 */
-	rc = regmap_update_bits(chip->regmap, chip->base + SMB5_DCDC_OTG_CFG,
-				SMB5_OTG_EN_SRC_CMD, 0);
+	if (!chip->otg_vbus)
+		return 0;
+
+	/* 2A, the vendor default for nabu; the table tops out at 3A. */
+	regulator_set_current_limit(chip->otg_vbus, 2000000, 2000000);
+	rc = regulator_enable(chip->otg_vbus);
 	if (rc)
-		return rc;
-
-	return regmap_update_bits(chip->regmap, chip->base + SMB5_DCDC_CMD_OTG,
-				  SMB5_OTG_EN, SMB5_OTG_EN);
+		dev_warn(chip->dev, "OTG 5V on failed: %d\n", rc);
+	return rc;
 }
 
-static int smb2_otg_disable(struct regulator_dev *rdev)
+static void smb2_otg_disable(struct smb2_chip *chip)
 {
-	struct smb2_chip *chip = rdev_get_drvdata(rdev);
+	if (!chip->otg_vbus)
+		return;
 
-	return regmap_update_bits(chip->regmap, chip->base + SMB5_DCDC_CMD_OTG,
-				  SMB5_OTG_EN, 0);
+	regulator_disable(chip->otg_vbus);
 }
-
-static int smb2_otg_is_enabled(struct regulator_dev *rdev)
-{
-	struct smb2_chip *chip = rdev_get_drvdata(rdev);
-	unsigned int val;
-	int rc;
-
-	rc = regmap_read(chip->regmap, chip->base + SMB5_DCDC_CMD_OTG, &val);
-	if (rc)
-		return rc;
-
-	return !!(val & SMB5_OTG_EN);
-}
-
-static const struct regulator_ops smb2_otg_ops = {
-	.enable     = smb2_otg_enable,
-	.disable    = smb2_otg_disable,
-	.is_enabled = smb2_otg_is_enabled,
-};
-
-/*
- * Without a valid_ops_mask the regulator core refuses regulator_enable() with
- * -EPERM: this supply has no device tree constraints of its own, so "may change
- * status" has to be granted here or the OTG 5V boost can never be turned on.
- */
-static const struct regulator_init_data smb2_otg_init_data = {
-	.constraints = {
-		.valid_ops_mask = REGULATOR_CHANGE_STATUS,
-	},
-};
-
-static const struct regulator_desc smb2_otg_desc = {
-	.name		= "usb-otg-vbus",
-	.type		= REGULATOR_VOLTAGE,
-	.owner		= THIS_MODULE,
-	.ops		= &smb2_otg_ops,
-	.fixed_uV	= 5000000,
-	.n_voltages	= 1,
-};
 
 static int smb2_probe(struct platform_device *pdev)
 {
@@ -2288,47 +2253,17 @@ static int smb2_probe(struct platform_device *pdev)
 		return rc;
 
 	if (data->is_smb5) {
-		struct regulator_config cfg = {
-			.dev			= chip->dev,
-			.driver_data		= chip,
-			.of_node		= chip->dev->of_node,
-			.init_data		= &smb2_otg_init_data,
-		};
-
-		rc = regmap_write(chip->regmap,
-				  chip->base + SMB5_DCDC_OTG_ILIM,
-				  SMB5_OTG_ILIM_2A);
-		if (rc)
-			dev_warn(chip->dev,
-				 "failed to set OTG current limit: %d\n", rc);
-
-		chip->otg_rdev = devm_regulator_register(chip->dev,
-							 &smb2_otg_desc, &cfg);
-		if (IS_ERR(chip->otg_rdev))
-			return dev_err_probe(chip->dev,
-					     PTR_ERR(chip->otg_rdev),
-					     "failed to register OTG regulator\n");
-
 		/*
-		 * "nabu,otg-force-on" keeps the 5V boost up from probe, which is
-		 * the only way to test the host path while the TCPM on this port
-		 * cannot report a CC attach (see nabu-power's dtsi).
+		 * The VBUS boost is the PM8150B "usb_vbus" regulator (see the
+		 * DT's usb-vbus-supply).  Do not register another one here: two
+		 * owners of DCDC_CMD_OTG made regulator_late_cleanup() switch
+		 * VBUS off behind our back about 30s after boot.
 		 */
-		if (of_property_read_bool(chip->dev->of_node, "nabu,otg-force-on")) {
-			struct regulator *vbus;
-
-			vbus = devm_regulator_get(chip->dev, "usb-otg-vbus");
-			if (IS_ERR(vbus)) {
-				dev_warn(chip->dev, "no usb-otg-vbus handle: %ld\n",
-					 PTR_ERR(vbus));
-			} else {
-				rc = regulator_enable(vbus);
-				if (rc)
-					dev_warn(chip->dev,
-						 "OTG force enable failed: %d\n", rc);
-				else
-					dev_info(chip->dev, "OTG boost forced on\n");
-			}
+		if (of_property_read_bool(chip->dev->of_node,
+					  "nabu,otg-force-on")) {
+			rc = smb2_otg_enable(chip);
+			if (!rc)
+				dev_info(chip->dev, "OTG boost forced on\n");
 		}
 	}
 
@@ -2344,7 +2279,7 @@ static int smb2_probe(struct platform_device *pdev)
 		chip->role_sw = NULL;
 
 		chip->otg_vbus = devm_regulator_get_optional(chip->dev,
-							    "usb-otg-vbus");
+							    "usb-vbus");
 		if (IS_ERR(chip->otg_vbus))
 			chip->otg_vbus = NULL;
 
