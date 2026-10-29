@@ -125,6 +125,18 @@
 #define OTG_EN_SRC_CFG_BIT				BIT(1)
 #define CONCURRENT_MODE_CFG_BIT				BIT(0)
 
+#define SMB5_DCDC_CMD_OTG	0x140
+#define SMB5_DCDC_OTG_CFG	0x153
+#define SMB5_DCDC_OTG_ILIM	0x152
+#define SMB5_OTG_EN		BIT(0)
+#define SMB5_OTG_EN_SRC_CMD	BIT(1)
+/*
+ * OTG current limit, 0.5A + 0.5A * value; the vendor driver programmes the DT
+ * default (2A on nabu) at probe and the reset value is the lowest step, which
+ * made the boost trip as soon as a device drew real current.
+ */
+#define SMB5_OTG_ILIM_2A	0x3
+
 #define OTG_ENG_OTG_CFG					0x1C0
 #define ENG_BUCKBOOST_HALT1_8_MODE_BIT			BIT(0)
 
@@ -507,8 +519,8 @@ struct smb2_chip {
 	bool role_sw_reported;
 	int typec_dbg_left;
 	int typec_settle;	/* extra applies: dwc3 drops the first request */
-	/* polls to stay sink-only after leaving host mode (see below) */
-	int typec_sink_hold;
+	/* consecutive polls without an attach while we are the host */
+	int typec_lost_votes;
 	/* consecutive polls that wanted host, to filter dual-role transients */
 	int typec_host_votes;
 	int typec_mode;		/* last Type-C mode written, -1 = none yet */
@@ -661,19 +673,6 @@ static void smb2_typec_set_mode(struct smb2_chip *chip, enum usb_role role)
 				val);
 	if (rc)
 		dev_warn(chip->dev, "typec: mode cfg write failed: %d\n", rc);
-
-	if (chip->role_sw)
-		usb_role_switch_set_role(chip->role_sw, role);
-
-	/* host mode means we feed the port: turn the SMB5 boost on/off */
-	if (role == USB_ROLE_HOST && chip->otg_vbus) {
-		int rc = regulator_enable(chip->otg_vbus);
-
-		if (rc)
-			dev_warn(chip->dev, "OTG 5V on failed: %d\n", rc);
-	} else if (chip->otg_vbus) {
-		regulator_disable(chip->otg_vbus);
-	}
 }
 
 static void smb2_typec_apply_role(struct smb2_chip *chip, enum usb_role role)
@@ -702,13 +701,21 @@ static void smb2_typec_apply_role(struct smb2_chip *chip, enum usb_role role)
 		usb_role_switch_set_role(chip->role_sw, role);
 	}
 
-	if (role == USB_ROLE_HOST && chip->otg_vbus) {
-		int rc = regulator_enable(chip->otg_vbus);
+	/*
+	 * Move the 5V boost only when the role really changes.  Re-asserting it
+	 * on every settle poll made the regulator core complain about
+	 * unbalanced disables, and a disable it did not expect can cut VBUS
+	 * under a device that is still attached.
+	 */
+	if (role != chip->typec_role && chip->otg_vbus) {
+		if (role == USB_ROLE_HOST) {
+			int rc = regulator_enable(chip->otg_vbus);
 
-		if (rc)
-			dev_warn(chip->dev, "OTG 5V on failed: %d\n", rc);
-	} else if (chip->otg_vbus) {
-		regulator_disable(chip->otg_vbus);
+			if (rc)
+				dev_warn(chip->dev, "OTG 5V on failed: %d\n", rc);
+		} else {
+			regulator_disable(chip->otg_vbus);
+		}
 	}
 
 	chip->typec_role = role;
@@ -788,6 +795,18 @@ static ssize_t typec_regs_show(struct device *dev,
 		len += sysfs_emit_at(buf, len, "%-15s %#04x = %#04x\n",
 				     r[i].name, r[i].reg, v);
 	}
+
+	/* charger/DCDC side: what the 5V boost is doing */
+	if (!regmap_read(chip->regmap, chip->base + SMB5_DCDC_CMD_OTG, &v))
+		len += sysfs_emit_at(buf, len, "%-15s %#04x = %#04x\n",
+				     "OTG_CMD", chip->base + SMB5_DCDC_CMD_OTG, v);
+	if (!regmap_read(chip->regmap, chip->base + SMB5_DCDC_OTG_ILIM, &v))
+		len += sysfs_emit_at(buf, len, "%-15s %#04x = %#04x\n",
+				     "OTG_ILIM", chip->base + SMB5_DCDC_OTG_ILIM, v);
+	if (!regmap_read(chip->regmap, chip->base + SMB5_DCDC_OTG_CFG, &v))
+		len += sysfs_emit_at(buf, len, "%-15s %#04x = %#04x\n",
+				     "OTG_CFG", chip->base + SMB5_DCDC_OTG_CFG, v);
+
 	return len;
 }
 static DEVICE_ATTR_RO(typec_regs);
@@ -879,22 +898,27 @@ static void smb2_typec_poll(struct work_struct *work)
 		role = USB_ROLE_DEVICE;
 		mode = USB_ROLE_DEVICE;
 		chip->typec_host_votes = 0;
-	} else if (!attached) {
-		role = USB_ROLE_DEVICE;		/* gadget ready for a PC */
+	} else if (chip->typec_role == USB_ROLE_HOST) {
 		/*
-		 * Right after a device was unplugged the user usually plugs a
-		 * charger; while the port is in dual role it only sees that
-		 * charger during its sink phase (2-4 s).  Pin the port to sink
-		 * for a few polls so that common swap is instant, then go back
-		 * to dual role so devices stay detectable.
+		 * Sourcing VBUS for a device: stay there until it is really gone.
+		 * The vendor's PD stack behaves the same way - the role is set
+		 * once on attach and cleared on detach, never re-derived while the
+		 * partner is attached - and re-deriving it here is what made the
+		 * headset drop off (the CC status blips to "no attach" now and
+		 * then even though the device is still there).
 		 */
-		mode = chip->typec_sink_hold ? USB_ROLE_DEVICE : USB_ROLE_NONE;
-		if (chip->typec_sink_hold)
-			chip->typec_sink_hold--;
-	} else if (we_are_source) {
+		if (attached)
+			chip->typec_lost_votes = 0;
+		else if (++chip->typec_lost_votes < 5)
+			goto out;
+		role = USB_ROLE_HOST;
+		mode = USB_ROLE_HOST;
+	} else if (attached && we_are_source) {
 		/*
-		 * Require the same reading twice before turning the port around:
-		 * a single sample during the dual-role rotation is not enough.
+		 * A sink is on the port (stick, headset, keyboard): we have to be
+		 * its host and feed it 5V.  Ask for the same reading twice so a
+		 * single sample taken mid dual-role rotation cannot turn the port
+		 * around by mistake.
 		 */
 		if (++chip->typec_host_votes < 2) {
 			role = chip->typec_role;
@@ -903,10 +927,18 @@ static void smb2_typec_poll(struct work_struct *work)
 		}
 		role = USB_ROLE_HOST;
 		mode = USB_ROLE_HOST;
-	} else {
-		chip->typec_host_votes = 0;
+		chip->typec_lost_votes = 0;
+	} else if (attached) {
+		/* attached, but we are the UFP: a charger or a PC */
 		role = USB_ROLE_DEVICE;
 		mode = USB_ROLE_DEVICE;
+		chip->typec_host_votes = 0;
+	} else {
+		/* nothing attached: stay in dual role so devices are visible */
+		role = USB_ROLE_DEVICE;
+		mode = USB_ROLE_NONE;
+		chip->typec_host_votes = 0;
+		chip->typec_lost_votes = 0;
 	}
 
 apply:
@@ -932,7 +964,6 @@ apply:
 		 * classification ourselves.
 		 */
 		if (prev == USB_ROLE_HOST && role != USB_ROLE_HOST) {
-			chip->typec_sink_hold = 3;	/* ~6 s of sink-only */
 			chip->apsd_retries = 0;
 			schedule_delayed_work(&chip->status_change_work,
 					      msecs_to_jiffies(200));
@@ -946,7 +977,8 @@ out:
 		 * cannot see a device; poll quickly until it expires and the port
 		 * goes back to dual role, then fall back to the long safety net.
 		 */
-		bool busy = chip->typec_sink_hold || chip->typec_host_votes > 0 ||
+		bool busy = chip->typec_host_votes > 0 ||
+			    chip->typec_lost_votes > 0 ||
 			    changed || chip->typec_settle;
 		unsigned long delay = busy ?
 				       msecs_to_jiffies(SMB2_TYPEC_POLL_MS_BUSY) :
@@ -1928,10 +1960,6 @@ static int smb2_init_irq(struct smb2_chip *chip, int *irq, const char *name,
  * The current limit keeps its reset value.  Offsets are relative to CHGR_BASE,
  * so 0x1140 / 0x1153 on PM8150B.
  */
-#define SMB5_DCDC_CMD_OTG	0x140
-#define SMB5_DCDC_OTG_CFG	0x153
-#define SMB5_OTG_EN		BIT(0)
-#define SMB5_OTG_EN_SRC_CMD	BIT(1)
 
 
 static int smb2_otg_enable(struct regulator_dev *rdev)
@@ -1939,8 +1967,16 @@ static int smb2_otg_enable(struct regulator_dev *rdev)
 	struct smb2_chip *chip = rdev_get_drvdata(rdev);
 	int rc;
 
+	/*
+	 * OTG_EN_SRC = 0: the boost follows the DCDC_CMD bit below, i.e. it is
+	 * under our control.  Leaving it at 1 hands the boost to the Type-C
+	 * block, whose CC state machine drops back to "no attach" now and then
+	 * even with a device plugged in - VBUS then disappears under the
+	 * device and it disconnects a second after enumerating.  The vendor
+	 * driver also configures VBUS "for software control" (writes 0 here).
+	 */
 	rc = regmap_update_bits(chip->regmap, chip->base + SMB5_DCDC_OTG_CFG,
-				SMB5_OTG_EN_SRC_CMD, SMB5_OTG_EN_SRC_CMD);
+				SMB5_OTG_EN_SRC_CMD, 0);
 	if (rc)
 		return rc;
 
@@ -2131,6 +2167,13 @@ static int smb2_probe(struct platform_device *pdev)
 			.of_node		= chip->dev->of_node,
 			.init_data		= &smb2_otg_init_data,
 		};
+
+		rc = regmap_write(chip->regmap,
+				  chip->base + SMB5_DCDC_OTG_ILIM,
+				  SMB5_OTG_ILIM_2A);
+		if (rc)
+			dev_warn(chip->dev,
+				 "failed to set OTG current limit: %d\n", rc);
 
 		chip->otg_rdev = devm_regulator_register(chip->dev,
 							 &smb2_otg_desc, &cfg);
