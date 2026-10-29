@@ -501,7 +501,7 @@ struct smb2_chip {
 	bool role_sw_reported;
 	int typec_dbg_left;
 	int typec_settle;	/* extra applies: dwc3 drops the first request */
-	enum usb_role typec_mode;	/* last Type-C mode written */
+	int typec_mode;		/* last Type-C mode written, -1 = none yet */
 	/* 0 = follow CC detection, otherwise force host/device */
 	enum usb_role typec_force;
 	struct delayed_work typec_work;
@@ -750,6 +750,38 @@ static ssize_t typec_role_store(struct device *dev,
 }
 static DEVICE_ATTR_RW(typec_role);
 
+/* Nabu: dump the SMB5 Type-C registers, to see how the state machine is set up. */
+static ssize_t typec_regs_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	static const struct { const char *name; u16 reg; } r[] = {
+		{ "MODE_CFG",       SMB5_TYPEC_BASE + 0x44 },
+		{ "EXIT_STATE_CFG", SMB5_TYPEC_BASE + 0x50 },
+		{ "CURRSRC_CFG",    SMB5_TYPEC_BASE + 0x52 },
+		{ "INTERRUPT_EN_1", SMB5_TYPEC_BASE + 0x5E },
+		{ "INTERRUPT_EN_2", SMB5_TYPEC_BASE + 0x60 },
+		{ "DEBOUNCE",       SMB5_TYPEC_BASE + 0x62 },
+		{ "U_USB_CFG",      SMB5_TYPEC_BASE + 0x70 },
+		{ "MICRO_USB_MODE", SMB5_TYPEC_BASE + 0x73 },
+		{ "SNK_STATUS",     SMB5_TYPEC_BASE + 0x06 },
+		{ "SRC_STATUS",     SMB5_TYPEC_BASE + 0x08 },
+		{ "STATE_MACHINE",  SMB5_TYPEC_BASE + 0x09 },
+		{ "MISC_STATUS",    SMB5_TYPEC_BASE + 0x0B },
+	};
+	struct smb2_chip *chip = dev_get_drvdata(dev);
+	int i, len = 0;
+	unsigned int v;
+
+	for (i = 0; i < ARRAY_SIZE(r); i++) {
+		if (regmap_read(chip->regmap, r[i].reg, &v))
+			continue;
+		len += sysfs_emit_at(buf, len, "%-15s %#04x = %#04x\n",
+				     r[i].name, r[i].reg, v);
+	}
+	return len;
+}
+static DEVICE_ATTR_RO(typec_regs);
+
 /*
  * Nabu: read what the SMB5 thinks of the Type-C port.
  *
@@ -827,9 +859,9 @@ static void smb2_typec_poll(struct work_struct *work)
 		mode = USB_ROLE_DEVICE;
 	}
 
-	if (mode != chip->typec_mode) {
+	if ((int)mode != chip->typec_mode) {
 		smb2_typec_set_mode(chip, mode);
-		chip->typec_mode = mode;
+		chip->typec_mode = (int)mode;
 		chip->typec_settle = 2;
 	}
 
@@ -2042,7 +2074,10 @@ static int smb2_probe(struct platform_device *pdev)
 
 		chip->typec_role = USB_ROLE_NONE;
 		chip->typec_force = USB_ROLE_NONE;
+		chip->typec_mode = -1;	/* force the first poll to program DRP */
 		chip->typec_dbg_left = 20;
+		if (device_create_file(chip->dev, &dev_attr_typec_regs))
+			dev_warn(chip->dev, "no typec_regs attribute\n");
 		if (device_create_file(chip->dev, &dev_attr_typec_role))
 			dev_warn(chip->dev, "no typec_role attribute\n");
 		smb2_typec_init(chip);
