@@ -304,6 +304,11 @@
 #define TYPEC_ROLE_DISABLE			BIT(0)
 #define TYPEC_TRY_MODE_MASK			GENMASK(4, 3)
 #define TYPEC_TRY_SNK				BIT(4)
+#define TYPEC_ROLE_DRP_TRY_SNK			TYPEC_TRY_SNK
+/* TYPE_C_MISC_STATUS (0x150B) */
+#define TYPEC_CC_ATTACHED			BIT(0)
+#define TYPEC_CC_ORIENTATION			BIT(1)
+#define TYPEC_SNK_SRC_MODE			BIT(6)
 #define TYPEC_TRY_SRC				BIT(3)
 
 #define TYPE_C_INTRPT_ENB_SOFTWARE_CTRL			0x368
@@ -495,6 +500,7 @@ struct smb2_chip {
 	struct usb_role_switch *role_sw;
 	bool role_sw_reported;
 	int typec_dbg_left;
+	int typec_settle;	/* extra applies: dwc3 drops the first request */
 	/* 0 = follow CC detection, otherwise force host/device */
 	enum usb_role typec_force;
 	struct delayed_work typec_work;
@@ -633,7 +639,9 @@ static void smb2_typec_set_mode(struct smb2_chip *chip, enum usb_role role)
 		val = TYPEC_ROLE_SNK_ONLY;
 		break;
 	default:
-		val = TYPEC_ROLE_SNK_ONLY;
+		/* automatic: dual role, try sink first so a charger is seen
+		 * immediately and a device is found by the try-source phase */
+		val = TYPEC_ROLE_DRP_TRY_SNK;
 		break;
 	}
 
@@ -664,9 +672,11 @@ static void smb2_typec_apply_role(struct smb2_chip *chip, enum usb_role role)
 	 * a request (see below), and an early return here made "write host again"
 	 * a no-op, i.e. there was no way to retry a switch that did not take.
 	 */
-	if (role != chip->typec_role)
+	if (role != chip->typec_role) {
 		dev_info(chip->dev, "typec: role %d -> %d\n",
 			 chip->typec_role, role);
+		chip->typec_settle = 2;
+	}
 
 	/*
 	 * NOTE: dwc3 drops the first role request after boot - the host
@@ -744,38 +754,10 @@ static void smb2_typec_poll(struct work_struct *work)
 {
 	struct smb2_chip *chip =
 		container_of(work, struct smb2_chip, typec_work.work);
-	unsigned int stat4 = 0;
-	bool attached, dfp;
-	int orientation, online = 0, rc;
+	unsigned int misc = 0;
+	bool attached, we_are_source;
 	enum usb_role role;
 
-	rc = regmap_read(chip->regmap, chip->base + TYPE_C_STATUS_4, &stat4);
-	if (rc)
-		goto out;
-
-	if (chip->typec_dbg_left > 0) {
-		unsigned int d1 = 0, d2 = 0, d3 = 0, d4 = 0, d5 = 0, dc = 0,
-			     dg = 0, dg2 = 0;
-
-		chip->typec_dbg_left--;
-		regmap_read(chip->regmap, chip->base + TYPE_C_STATUS_1, &d1);
-		regmap_read(chip->regmap, chip->base + TYPE_C_STATUS_2, &d2);
-		regmap_read(chip->regmap, chip->base + TYPE_C_STATUS_3, &d3);
-		regmap_read(chip->regmap, chip->base + TYPE_C_STATUS_5, &d5);
-		regmap_read(chip->regmap,
-			    chip->base + TYPE_C_INTRPT_ENB_SOFTWARE_CTRL, &dc);
-		regmap_read(chip->regmap, chip->base + TYPE_C_CFG, &dg);
-		regmap_read(chip->regmap, chip->base + TYPE_C_CFG_2, &dg2);
-		dev_info(chip->dev,
-			 "typec dbg: s1=%#x s2=%#x s3=%#x s4=%#x s5=%#x ctrl=%#x cfg=%#x cfg2=%#x\n",
-			 d1, d2, d3, stat4, d5, dc, dg, dg2);
-	}
-
-	/*
-	 * The charger probes before the dwc3 role switch exists, so keep trying
-	 * here instead of failing the probe with -EPROBE_DEFER.  Report the
-	 * failure once so a missing/hidden switch is visible in dmesg.
-	 */
 	if (!chip->role_sw) {
 		chip->role_sw = usb_role_switch_get(chip->dev);
 		if (IS_ERR(chip->role_sw)) {
@@ -791,43 +773,38 @@ static void smb2_typec_poll(struct work_struct *work)
 		}
 	}
 
-	attached = !!(stat4 & CC_ATTACHED_BIT);
-	dfp = !!(stat4 & UFP_DFP_MODE_STATUS_BIT);
-	orientation = !!(stat4 & CC_ORIENTATION_BIT);
+	if (regmap_read(chip->regmap, SMB5_TYPE_C_MISC_STATUS, &misc))
+		goto out;
 
-	if (attached != chip->typec_attached || dfp != chip->typec_dfp ||
-	    orientation != chip->typec_orientation) {
-		unsigned int s1 = 0, s2 = 0, s5 = 0;
+	attached = !!(misc & TYPEC_CC_ATTACHED);
+	we_are_source = !!(misc & TYPEC_SNK_SRC_MODE);
 
-		regmap_read(chip->regmap, chip->base + TYPE_C_STATUS_1, &s1);
-		regmap_read(chip->regmap, chip->base + TYPE_C_STATUS_2, &s2);
-		regmap_read(chip->regmap, chip->base + TYPE_C_STATUS_5, &s5);
+	if (attached != chip->typec_attached ||
+	    we_are_source != chip->typec_dfp) {
 		dev_info(chip->dev,
-			 "typec: attached=%d ufp_dfp=%d orientation=%d status4=%#x s1=%#x s2=%#x s5=%#x\n",
-			 attached, dfp, orientation, stat4, s1, s2, s5);
+			 "typec: attached=%d we_are_source=%d orientation=%d (misc=%#x)\n",
+			 attached, we_are_source,
+			 !!(misc & TYPEC_CC_ORIENTATION), misc);
 		chip->typec_attached = attached;
-		chip->typec_dfp = dfp;
-		chip->typec_orientation = orientation;
+		chip->typec_dfp = we_are_source;
 	}
 
-	smb2_get_prop_usb_online(chip, &online);
-
-	if (!attached)
-		role = USB_ROLE_NONE;
-	else if (dfp && !online)
-		/* Sink on the other end and nobody is feeding VBUS: the only way
-		 * this can work is us acting as the host.  The "!online" guard
-		 * keeps a charger from ever being driven with our own 5V. */
-		role = USB_ROLE_HOST;
+	/*
+	 * Automatic role: a sink on the port means we are its host and have to
+	 * feed it 5V; a charger or a PC - or nothing at all - keeps us the
+	 * device.  The Type-C block runs in dual role, so it detects both.
+	 */
+	if (chip->typec_force != USB_ROLE_NONE)
+		role = chip->typec_force;
 	else
-		role = USB_ROLE_DEVICE;
+		role = (attached && we_are_source) ? USB_ROLE_HOST :
+						     USB_ROLE_DEVICE;
 
-	if (chip->typec_force != USB_ROLE_NONE) {
-		smb2_typec_apply_role(chip, chip->typec_force);
-	} else if (attached && dfp && !online) {
-		smb2_typec_apply_role(chip, USB_ROLE_HOST);
-	} else if (!attached && chip->typec_role == USB_ROLE_HOST) {
-		smb2_typec_apply_role(chip, USB_ROLE_NONE);
+	if (role != chip->typec_role || chip->typec_settle) {
+		smb2_typec_apply_role(chip, role);
+		chip->typec_role = role;
+		if (chip->typec_settle)
+			chip->typec_settle--;
 	}
 
 out:
@@ -2037,16 +2014,21 @@ static int smb2_probe(struct platform_device *pdev)
 			dev_warn(chip->dev, "no typec_role attribute\n");
 		smb2_typec_init(chip);
 		INIT_DELAYED_WORK(&chip->typec_work, smb2_typec_poll);
-		/* no polling by default: it would keep the SoC out of its deepest
-		 * s2idle state, and CC reports nothing on this board anyway */
+		/* Automatic role detection is a 2 s poll.  The old "no polling"
+		 * default existed only because the Type-C registers were read at
+		 * the wrong address; with that fixed the poll is what makes the
+		 * port configure itself. */
 		{
-			unsigned int s4 = 0;
+			unsigned int misc = 0;
 
-			regmap_read(chip->regmap, chip->base + TYPE_C_STATUS_4,
-				    &s4);
+			regmap_read(chip->regmap, SMB5_TYPE_C_MISC_STATUS,
+				    &misc);
 			dev_info(chip->dev,
-				 "typec init: status4=%#x (no polling)\n", s4);
+				 "typec init: misc=%#x, automatic role polling on\n",
+				 misc);
 		}
+		/* start the automatic role poll */
+		schedule_delayed_work(&chip->typec_work, 0);
 	}
 
 	/* Initialise charger state */
