@@ -501,6 +501,7 @@ struct smb2_chip {
 	bool role_sw_reported;
 	int typec_dbg_left;
 	int typec_settle;	/* extra applies: dwc3 drops the first request */
+	enum usb_role typec_mode;	/* last Type-C mode written */
 	/* 0 = follow CC detection, otherwise force host/device */
 	enum usb_role typec_force;
 	struct delayed_work typec_work;
@@ -686,7 +687,19 @@ static void smb2_typec_apply_role(struct smb2_chip *chip, enum usb_role role)
 	 * (see KNOWN-ISSUES 2.6.1).  Bouncing the role from the driver was
 	 * tried and made things worse, so it is left to the caller for now.
 	 */
-	smb2_typec_set_mode(chip, role);
+	if (chip->role_sw) {
+		/* dwc3 drops the first request after boot; the poll retries */
+		usb_role_switch_set_role(chip->role_sw, role);
+	}
+
+	if (role == USB_ROLE_HOST && chip->otg_vbus) {
+		int rc = regulator_enable(chip->otg_vbus);
+
+		if (rc)
+			dev_warn(chip->dev, "OTG 5V on failed: %d\n", rc);
+	} else if (chip->otg_vbus) {
+		regulator_disable(chip->otg_vbus);
+	}
 
 	chip->typec_role = role;
 }
@@ -756,7 +769,7 @@ static void smb2_typec_poll(struct work_struct *work)
 		container_of(work, struct smb2_chip, typec_work.work);
 	unsigned int misc = 0;
 	bool attached, we_are_source;
-	enum usb_role role;
+	enum usb_role role, mode;
 
 	if (!chip->role_sw) {
 		chip->role_sw = usb_role_switch_get(chip->dev);
@@ -794,11 +807,31 @@ static void smb2_typec_poll(struct work_struct *work)
 	 * feed it 5V; a charger or a PC - or nothing at all - keeps us the
 	 * device.  The Type-C block runs in dual role, so it detects both.
 	 */
-	if (chip->typec_force != USB_ROLE_NONE)
+	/*
+	 * Three-way decision.  While nothing is attached the block has to stay in
+	 * dual role: a device (sink) only pulls Dp up once we offer VBUS, so
+	 * pinning the port to sink whenever it is idle would make devices
+	 * invisible forever - which is exactly what happened before.
+	 */
+	if (chip->typec_force != USB_ROLE_NONE) {
 		role = chip->typec_force;
-	else
-		role = (attached && we_are_source) ? USB_ROLE_HOST :
-						     USB_ROLE_DEVICE;
+		mode = role;
+	} else if (!attached) {
+		role = USB_ROLE_DEVICE;		/* gadget ready for a PC */
+		mode = USB_ROLE_NONE;		/* but the port stays DRP */
+	} else if (we_are_source) {
+		role = USB_ROLE_HOST;
+		mode = USB_ROLE_HOST;
+	} else {
+		role = USB_ROLE_DEVICE;
+		mode = USB_ROLE_DEVICE;
+	}
+
+	if (mode != chip->typec_mode) {
+		smb2_typec_set_mode(chip, mode);
+		chip->typec_mode = mode;
+		chip->typec_settle = 2;
+	}
 
 	if (role != chip->typec_role || chip->typec_settle) {
 		smb2_typec_apply_role(chip, role);
