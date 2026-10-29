@@ -1539,7 +1539,8 @@ static const struct smb2_register smb2_init_seq[] = {
 static int smb2_init_hw(struct smb2_chip *chip)
 {
 	u8 lobuf[2];
-	int rc, i, iterm, raw;
+	int rc, i, iterm, raw, term_ma;
+	s32 term_s32;
 
 	for (i = 0; i < ARRAY_SIZE(smb2_init_seq); i++) {
 		/* On SMB5 the Type-C/OTG blocks and the MISC status-pin config
@@ -1649,10 +1650,21 @@ static int smb2_init_hw(struct smb2_chip *chip)
 			return dev_err_probe(chip->dev, rc,
 					     "failed to rerun APSD\n");
 
-		/* ADC-based charge termination at a 400mA taper, matching the
-		 * downstream parameters. raw = (400 * 32767) / 10000 = 1310,
-		 * stored as a signed 16-bit big-endian value. */
-		iterm = (-400 * 32767) / 10000;
+		/*
+		 * ADC-based charge termination.  The threshold has to sit clearly
+		 * above the current the pack keeps drawing once it is full -
+		 * with a hardcoded 400 mA the pack floated at 400-410 mA, i.e.
+		 * just above the limit, so termination never fired and the
+		 * charger trickled for ever.  Use the DT value
+		 * (qcom,fg-sys-term-current, -500 here).
+		 */
+		term_ma = 500;
+		if (!of_property_read_u32(chip->dev->of_node,
+					  "qcom,fg-sys-term-current", &term_s32))
+			term_ma = abs((int)term_s32);
+		if (term_ma < 100 || term_ma > 2000)
+			term_ma = 500;
+		iterm = (-term_ma * 32767) / 10000;
 		rc = regmap_write(chip->regmap,
 				  chip->base + CHGR_ADC_ITERM_UP_THD_MSB,
 				  (iterm >> 8) & 0xff);
