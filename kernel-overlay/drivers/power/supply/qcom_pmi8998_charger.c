@@ -866,10 +866,25 @@ static void smb2_typec_poll(struct work_struct *work)
 	}
 
 	if (role != chip->typec_role || chip->typec_settle) {
+		enum usb_role prev = chip->typec_role;
+
 		smb2_typec_apply_role(chip, role);
 		chip->typec_role = role;
 		if (chip->typec_settle)
 			chip->typec_settle--;
+
+		/*
+		 * Leaving host mode: while we were sourcing VBUS the charger saw a
+		 * live port the whole time, so its plug interrupt never fires and
+		 * APSD is not re-run - a charger attached right after unplugging a
+		 * device went unnoticed until the cable was re-seated.  Kick the
+		 * classification ourselves.
+		 */
+		if (prev == USB_ROLE_HOST && role != USB_ROLE_HOST) {
+			chip->apsd_retries = 0;
+			schedule_delayed_work(&chip->status_change_work,
+					      msecs_to_jiffies(200));
+		}
 	}
 
 out:
