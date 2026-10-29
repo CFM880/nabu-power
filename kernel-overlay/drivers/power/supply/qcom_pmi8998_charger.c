@@ -522,6 +522,9 @@ struct smb2_chip {
 	int apsd_retries;
 	int online_retries;
 	bool charge_full;
+	/* last values written to the hardware, to avoid pointless rewrites */
+	unsigned int last_fcc_ua;
+	unsigned int last_fv_uv;
 	bool is_smb5;
 };
 
@@ -1120,6 +1123,17 @@ static void smb2_status_change_work(struct work_struct *work)
 
 static int smb2_set_fast_charge_current(struct smb2_chip *chip, unsigned int ua)
 {
+	/*
+	 * Rewriting the setpoint makes the SMB5 restart its regulation loop, so
+	 * the charge current visibly dips for a moment.  The software JEITA
+	 * monitor re-applies the same value every 15 s, which showed up as a
+	 * "unstable charging power" oscillation between ~1.1 and ~1.5 A.  Only
+	 * touch the hardware when the value really changes.
+	 */
+	if (ua == chip->last_fcc_ua)
+		return 0;
+
+	chip->last_fcc_ua = ua;
 	return regmap_update_bits(chip->regmap,
 				  chip->base + FAST_CHARGE_CURRENT_CFG,
 				  FAST_CHARGE_CURRENT_SETTING_MASK,
@@ -1132,6 +1146,11 @@ static int smb2_set_float_voltage(struct smb2_chip *chip, unsigned int uv)
 
 	if (uv < chip->fv_base_uv)
 		uv = chip->fv_base_uv;
+
+	if (uv == chip->last_fv_uv)	/* same reason as the current setpoint */
+		return 0;
+
+	chip->last_fv_uv = uv;
 	raw = (uv - chip->fv_base_uv) / chip->fv_step_uv;
 
 	return regmap_update_bits(chip->regmap, chip->base + FLOAT_VOLTAGE_CFG,
