@@ -308,6 +308,8 @@
 #define CMD_HVDCP_2					0x343
 #define HVDCP_FORCE_9V_BIT				BIT(4)
 #define HVDCP_FORCE_5V_BIT				BIT(3)
+#define HVDCP_SINGLE_DECREMENT_BIT			BIT(1)
+#define HVDCP_SINGLE_INCREMENT_BIT			BIT(0)
 
 /*
  * Nabu: the SMB5 Type-C block lives at its own base (0x1500), not in the
@@ -537,6 +539,17 @@ struct smb2_chip {
 	int typec_settle;	/* extra applies: dwc3 drops the first request */
 	/* consecutive polls without an attach while we are the host */
 	int typec_lost_votes;
+
+	/* charge pump (fast charge) */
+	struct power_supply *cp_psy;
+	struct power_supply *batt_psy;
+	struct delayed_work cp_work;
+	bool cp_active;
+	bool cp_requested;
+	bool cp_auto;		/* start on a QC adapter without being asked */
+	bool cp_failed;		/* this plug session already failed once */
+	int cp_taper;
+	unsigned int cp_ibat_ua;
 	/* consecutive polls that wanted host, to filter dual-role transients */
 	int typec_host_votes;
 	unsigned int typec_polls;
@@ -597,6 +610,10 @@ static enum power_supply_property smb2_properties[] = {
 	POWER_SUPPLY_PROP_ONLINE,
 	POWER_SUPPLY_PROP_USB_TYPE,
 };
+
+static void smb2_cp_stop(struct smb2_chip *chip, const char *why);
+static int smb2_cp_start(struct smb2_chip *chip);
+static void smb2_cp_work(struct work_struct *work);
 
 static int smb2_get_prop_usb_online(struct smb2_chip *chip, int *val)
 {
@@ -1373,6 +1390,9 @@ static void smb2_status_change_work(struct work_struct *work)
 
 	smb2_get_prop_usb_online(chip, &usb_online);
 	if (!usb_online) {
+		chip->cp_failed = false;	/* fresh plug may work */
+		if (chip->cp_active)
+			smb2_cp_stop(chip, "unplugged");
 		/* The adapter may already be attached at boot before the power
 		 * path settles; keep retrying instead of relying on a plug
 		 * interrupt that never comes for a boot-time cable. */
@@ -1482,6 +1502,15 @@ static void smb2_status_change_work(struct work_struct *work)
 	}
 
 	power_supply_changed(chip->chg_psy);
+
+	/*
+	 * With the adapter classified, see whether the charge pump can take
+	 * over.  It re-checks every safety gate itself and quietly falls back
+	 * to this 5V path when anything does not line up.
+	 */
+	if (chip->is_smb5 && !chip->cp_active)
+		schedule_delayed_work(&chip->cp_work,
+				      msecs_to_jiffies(2000));
 }
 
 static int smb2_set_fast_charge_current(struct smb2_chip *chip, unsigned int ua)
@@ -2001,13 +2030,22 @@ static int smb2_init_hw(struct smb2_chip *chip)
 		 * never asked for high voltage. The downstream driver enables
 		 * this in smblib_apsd_enable().
 		 */
+		/*
+		 * BC1.2 source detection plus HVDCP *detection*: the QC handshake
+		 * only runs when an adapter is plugged, so it has to be armed
+		 * from the start or a later FORCE_9V request is ignored.  The
+		 * voltage policy stays 5V (see USBIN_ADAPTER_ALLOW below), so
+		 * nothing goes up until the charge pump asks for it.
+		 */
 		rc = regmap_update_bits(chip->regmap,
 					chip->base + USBIN_OPTIONS_1_CFG,
 					AUTO_SRC_DETECT_BIT |
 					HVDCP_AUTH_ALG_EN_CFG_BIT |
 					HVDCP_EN_BIT |
 					HVDCP_AUTONOMOUS_MODE_EN_CFG_BIT,
-					AUTO_SRC_DETECT_BIT);
+					AUTO_SRC_DETECT_BIT |
+					HVDCP_AUTH_ALG_EN_CFG_BIT |
+					HVDCP_EN_BIT);
 		if (rc < 0)
 			return dev_err_probe(chip->dev, rc,
 					     "failed to enable BC1.2\n");
@@ -2210,6 +2248,341 @@ static void smb2_otg_disable(struct smb2_chip *chip)
 	regulator_disable(chip->otg_vbus);
 }
 
+/* ---- charge pump (fast charge) ------------------------------------------
+ *
+ * The board can charge much faster than the SMB5 buck allows by running a
+ * 2:1 charge pump (LN8000) on a 9V adapter: VBUS ~9V in, ~2x the current into
+ * the battery.  The pump has its own regulation loops, so the job here is
+ * only sequencing: ask the QC adapter for 9V, stop the buck so the two do not
+ * fight, configure the pump conservatively, watch it, and always be able to
+ * fall back to plain 5V charging.
+ */
+#define SMB2_CP_VFLOAT_UV	4400000		/* 4.40V charge voltage */
+#define SMB2_CP_IIN_UA		1600000		/* 1.6A in -> ~3A into the battery */
+#define SMB2_CP_VBUS_MIN_UV	7500000
+#define SMB2_CP_VBUS_MAX_UV	11000000
+#define SMB2_CP_TAPER_UA	300000
+#define SMB2_CP_TEMP_MIN	100		/* 10.0C */
+#define SMB2_CP_TEMP_MAX	450		/* 45.0C */
+#define SMB2_CP_POLL_MS		1000
+#define SMB2_CP_TAPER_COUNT	3
+
+static int smb2_get_iio_chan(struct smb2_chip *chip, struct iio_channel *chan,
+			     int *val);
+
+static int smb2_cp_psy_get(struct smb2_chip *chip)
+{
+	if (!chip->cp_psy)
+		chip->cp_psy = power_supply_get_by_name("ln8000-charger");
+	if (!chip->batt_psy)
+		chip->batt_psy = power_supply_get_by_name("qcom-battery");
+	return chip->cp_psy ? 0 : -ENODEV;
+}
+
+static int smb2_cp_set(struct smb2_chip *chip, enum power_supply_property p,
+		       int val)
+{
+	union power_supply_propval v = { .intval = val };
+
+	if (smb2_cp_psy_get(chip))
+		return -ENODEV;
+
+	return power_supply_set_property(chip->cp_psy, p, &v);
+}
+
+static int smb2_batt_get(struct smb2_chip *chip, enum power_supply_property p,
+			 int *val)
+{
+	union power_supply_propval v = { };
+
+	if (smb2_cp_psy_get(chip) || !chip->batt_psy)
+		return -ENODEV;
+
+	if (power_supply_get_property(chip->batt_psy, p, &v))
+		return -EIO;
+
+	*val = v.intval;
+	return 0;
+}
+
+static bool smb2_apsd_qc_capable(struct smb2_chip *chip)
+{
+	unsigned int res = 0;
+
+	if (regmap_read(chip->regmap, chip->base + APSD_RESULT_STATUS, &res))
+		return false;
+
+	return !!(res & (QC_3P0_BIT | QC_2P0_BIT));
+}
+
+static void smb2_cp_restore_5v(struct smb2_chip *chip)
+{
+	/* HVDCP off again: plain 5V charging, no QC negotiation */
+	regmap_update_bits(chip->regmap, chip->base + USBIN_OPTIONS_1_CFG,
+			   HVDCP_EN_BIT | HVDCP_AUTH_ALG_EN_CFG_BIT |
+			   HVDCP_AUTONOMOUS_MODE_EN_CFG_BIT, 0);
+	regmap_write(chip->regmap, chip->base + USBIN_ADAPTER_ALLOW_CFG,
+		     USBIN_ADAPTER_ALLOW_5V);
+	regmap_write(chip->regmap, chip->base + CMD_HVDCP_2,
+		     HVDCP_FORCE_5V_BIT);
+
+	/* re-classify at 5V: the QC attempt above leaves APSD stale */
+	regmap_update_bits(chip->regmap, chip->base + CMD_APSD,
+			   APSD_RERUN_BIT, APSD_RERUN_BIT);
+	chip->apsd_retries = 0;
+	schedule_delayed_work(&chip->status_change_work,
+			      msecs_to_jiffies(300));
+}
+
+static void smb2_cp_stop(struct smb2_chip *chip, const char *why)
+{
+	if (!chip->cp_active && !chip->cp_requested)
+		return;
+
+	dev_info(chip->dev, "cp: stop (%s), back to 5V charging\n", why);
+
+	if (chip->cp_active)
+		smb2_cp_set(chip, POWER_SUPPLY_PROP_PRESENT, 0);
+	chip->cp_active = false;
+	chip->cp_requested = false;
+	chip->cp_taper = 0;
+	power_supply_changed(chip->chg_psy);
+
+	/* hand the battery back to the buck */
+	regmap_update_bits(chip->regmap, chip->base + CHARGING_ENABLE_CMD,
+			   CHARGING_ENABLE_CMD_BIT, CHARGING_ENABLE_CMD_BIT);
+	smb2_cp_restore_5v(chip);
+}
+
+static int smb2_cp_start(struct smb2_chip *chip)
+{
+	unsigned int vbus = 0;
+	int rc, i, temp = 0, cap = 0;
+
+	if (chip->cp_active)
+		return 0;
+
+	if (smb2_cp_psy_get(chip)) {
+		dev_info(chip->dev, "cp: no ln8000 charger present\n");
+		return -ENODEV;
+	}
+
+	/* Safety gates: never start the pump outside this window. */
+	if (!smb2_batt_get(chip, POWER_SUPPLY_PROP_TEMP, &temp) &&
+	    (temp < SMB2_CP_TEMP_MIN || temp > SMB2_CP_TEMP_MAX)) {
+		dev_info(chip->dev, "cp: battery %d (0.1C) outside the window\n",
+			 temp);
+		return -ERANGE;
+	}
+	if (!smb2_batt_get(chip, POWER_SUPPLY_PROP_CAPACITY, &cap) &&
+	    cap >= 90) {
+		dev_info(chip->dev, "cp: battery at %d%%, not worth it\n", cap);
+		return -ERANGE;
+	}
+
+	/*
+	 * Plain DCP charging keeps HVDCP disabled and this board's APSD does not
+	 * reliably report QC3 on a runtime re-classification, so judge by
+	 * behaviour instead: ask for 9V and see whether VBUS actually goes up.
+	 * A non-QC adapter simply stays at 5V and we fall back.
+	 */
+	regmap_update_bits(chip->regmap, chip->base + USBIN_OPTIONS_1_CFG,
+			   HVDCP_EN_BIT | HVDCP_AUTH_ALG_EN_CFG_BIT |
+			   HVDCP_AUTONOMOUS_MODE_EN_CFG_BIT,
+			   HVDCP_EN_BIT | HVDCP_AUTH_ALG_EN_CFG_BIT |
+			   HVDCP_AUTONOMOUS_MODE_EN_CFG_BIT);
+	regmap_write(chip->regmap, chip->base + USBIN_ADAPTER_ALLOW_CFG,
+		     USBIN_ADAPTER_ALLOW_5V_OR_9V);
+
+	/*
+	 * Ask for high voltage.  Let the PMIC's autonomous HVDCP mode raise it
+	 * (that is what a QC2/QC3 adapter answers to), then trim down to about
+	 * 2 x VBAT + margin with decrement pulses so the pump does not burn the
+	 * excess in heat.
+	 */
+	{
+		unsigned int vbat = 0, target = 0;
+		int dec;
+
+		smb2_batt_get(chip, POWER_SUPPLY_PROP_VOLTAGE_NOW, (int *)&vbat);
+		target = vbat * 2 + 700000;
+		if (target < SMB2_CP_VBUS_MIN_UV)
+			target = SMB2_CP_VBUS_MIN_UV;
+		if (target > SMB2_CP_VBUS_MAX_UV)
+			target = SMB2_CP_VBUS_MAX_UV;
+
+		/*
+		 * QC3 ramps in 200mV steps and a FORCE_9V in between upsets its
+		 * state machine, so pulse first; only ask for a hard 9V when
+		 * pulsing does not move the adapter at all (QC2 adapters).
+		 */
+		for (i = 0; i < 30; i++) {
+			smb2_get_iio_chan(chip, chip->usb_in_v_chan,
+					  (int *)&vbus);
+			if (vbus >= target)
+				break;
+			regmap_write(chip->regmap, chip->base + CMD_HVDCP_2,
+				     HVDCP_SINGLE_INCREMENT_BIT);
+			msleep(100);
+		}
+
+		if (vbus < SMB2_CP_VBUS_MIN_UV) {
+			regmap_write(chip->regmap, chip->base + CMD_HVDCP_2, 0);
+			regmap_write(chip->regmap, chip->base + CMD_HVDCP_2,
+				     HVDCP_FORCE_9V_BIT);
+			for (i = 0; i < 20; i++) {
+				msleep(100);
+				smb2_get_iio_chan(chip, chip->usb_in_v_chan,
+						  (int *)&vbus);
+				if (vbus >= target)
+					break;
+			}
+		}
+
+		/* trim down if the adapter went higher than we need */
+		for (dec = 0; dec < 25 && vbus > target + 400000; dec++) {
+			regmap_write(chip->regmap, chip->base + CMD_HVDCP_2,
+				     HVDCP_SINGLE_DECREMENT_BIT);
+			msleep(100);
+			smb2_get_iio_chan(chip, chip->usb_in_v_chan,
+					  (int *)&vbus);
+		}
+
+		dev_info(chip->dev, "cp: VBUS %u uV (target %u, %d trims)\n",
+			 vbus, target, dec);
+	}
+
+	if (vbus < SMB2_CP_VBUS_MIN_UV) {
+		unsigned int res = 0;
+
+		regmap_read(chip->regmap, chip->base + APSD_RESULT_STATUS, &res);
+		dev_info(chip->dev,
+			 "cp: adapter did not take 9V (vbus=%u apsd=%#x)\n",
+			 vbus, res);
+		smb2_cp_restore_5v(chip);
+		return -EOPNOTSUPP;
+	}
+
+	/* 2. configure the pump before switching it on */
+	smb2_cp_set(chip, POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE,
+		    SMB2_CP_VFLOAT_UV);
+	smb2_cp_set(chip, POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
+		    SMB2_CP_IIN_UA);
+
+	/* 3. the buck must not charge from the same 9V rail */
+	regmap_update_bits(chip->regmap, chip->base + CHARGING_ENABLE_CMD,
+			   CHARGING_ENABLE_CMD_BIT, 0);
+
+	/* 4. run the pump */
+	rc = smb2_cp_set(chip, POWER_SUPPLY_PROP_PRESENT, 1);
+	if (rc) {
+		dev_warn(chip->dev, "cp: enable failed: %d\n", rc);
+		smb2_cp_stop(chip, "enable failed");
+		return rc;
+	}
+
+	chip->cp_active = true;
+	chip->cp_requested = true;
+	chip->cp_taper = 0;
+	power_supply_changed(chip->chg_psy);
+	dev_info(chip->dev, "cp: running, VBUS %u uV, IIN %u uA, VFLOAT %u uV\n",
+		 vbus, SMB2_CP_IIN_UA, SMB2_CP_VFLOAT_UV);
+
+	schedule_delayed_work(&chip->cp_work,
+			      msecs_to_jiffies(SMB2_CP_POLL_MS));
+	return 0;
+}
+
+static void smb2_cp_work(struct work_struct *work)
+{
+	struct smb2_chip *chip =
+		container_of(work, struct smb2_chip, cp_work.work);
+	unsigned int vbus = 0;
+	int online = 0, ibat = 0, temp = 0, cap = 0, rc;
+
+	if (!chip->cp_active) {
+		if (chip->cp_auto && !chip->cp_failed &&
+		    smb2_cp_start(chip))
+			chip->cp_failed = true;	/* once per plug session */
+		return;
+	}
+
+	smb2_get_prop_usb_online(chip, &online);
+	if (!online) {
+		smb2_cp_stop(chip, "adapter gone");
+		return;
+	}
+
+	rc = smb2_get_iio_chan(chip, chip->usb_in_v_chan, (int *)&vbus);
+	if (rc < 0) {
+		/* A failed ADC read is not a fault: try again next tick. */
+		dev_info(chip->dev, "cp: VBUS read failed: %d\n", rc);
+	} else if (vbus < SMB2_CP_VBUS_MIN_UV ||
+		   vbus > SMB2_CP_VBUS_MAX_UV) {
+		dev_info(chip->dev, "cp: VBUS out of window (%u uV)\n", vbus);
+		smb2_cp_stop(chip, "vbus window");
+		return;
+	}
+
+	if (!smb2_batt_get(chip, POWER_SUPPLY_PROP_CURRENT_NOW, &ibat))
+		chip->cp_ibat_ua = ibat;
+
+	if (!smb2_batt_get(chip, POWER_SUPPLY_PROP_TEMP, &temp) &&
+	    (temp < SMB2_CP_TEMP_MIN || temp > SMB2_CP_TEMP_MAX)) {
+		smb2_cp_stop(chip, "battery temperature");
+		return;
+	}
+	if (!smb2_batt_get(chip, POWER_SUPPLY_PROP_CAPACITY, &cap) &&
+	    cap >= 92) {
+		smb2_cp_stop(chip, "battery full enough");
+		return;
+	}
+
+	/* Taper: the pump is delivering less than the battery wants - done. */
+	if (chip->cp_ibat_ua < SMB2_CP_TAPER_UA) {
+		if (++chip->cp_taper >= SMB2_CP_TAPER_COUNT) {
+			smb2_cp_stop(chip, "taper");
+			return;
+		}
+	} else {
+		chip->cp_taper = 0;
+	}
+
+	schedule_delayed_work(&chip->cp_work,
+			      msecs_to_jiffies(SMB2_CP_POLL_MS));
+}
+
+static ssize_t cp_enable_show(struct device *dev,
+			      struct device_attribute *attr, char *buf)
+{
+	struct smb2_chip *chip = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%d%s\n", chip->cp_active ? 1 : 0,
+			  chip->cp_active ? "" : " (idle)");
+}
+
+static ssize_t cp_enable_store(struct device *dev,
+			       struct device_attribute *attr, const char *buf,
+			       size_t count)
+{
+	struct smb2_chip *chip = dev_get_drvdata(dev);
+	int val, rc;
+
+	if (kstrtoint(buf, 0, &val))
+		return -EINVAL;
+
+	if (val) {
+		rc = smb2_cp_start(chip);
+		if (rc)
+			return rc;
+	} else {
+		smb2_cp_stop(chip, "user");
+	}
+
+	return count;
+}
+static DEVICE_ATTR_RW(cp_enable);
+
 static int smb2_probe(struct platform_device *pdev)
 {
 	struct power_supply_config supply_config = {};
@@ -2378,8 +2751,12 @@ static int smb2_probe(struct platform_device *pdev)
 			dev_warn(chip->dev, "no typec_regs attribute\n");
 		if (device_create_file(chip->dev, &dev_attr_typec_role))
 			dev_warn(chip->dev, "no typec_role attribute\n");
+		if (device_create_file(chip->dev, &dev_attr_cp_enable))
+			dev_warn(chip->dev, "no cp_enable attribute\n");
 		smb2_typec_init(chip);
 		INIT_DELAYED_WORK(&chip->typec_work, smb2_typec_poll);
+		INIT_DELAYED_WORK(&chip->cp_work, smb2_cp_work);
+		chip->cp_auto = true;
 		/* Automatic role detection is a 2 s poll.  The old "no polling"
 		 * default existed only because the Type-C registers were read at
 		 * the wrong address; with that fixed the poll is what makes the

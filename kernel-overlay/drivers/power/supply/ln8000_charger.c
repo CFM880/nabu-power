@@ -336,6 +336,8 @@ struct ln8000_info {
     bool volt_qual;             /* all voltages are qualified */
     bool usb_present;           /* usb plugged (present) */
     bool chg_en;                /* charging enavbled */
+    unsigned int req_vfloat_uv; /* float voltage requested by the master */
+    unsigned int req_iin_ua;    /* input current limit requested by the master */
     bool rcp_en;                /* reverse current protection enabled */
     bool thermal_limited;       /* charge pump stopped due to battery temp */
     int vbat_ovp_alarm_th;      /* vbat ovp alarm threshold */
@@ -1168,6 +1170,12 @@ resched:
                           msecs_to_jiffies(LN8000_THERMAL_POLL_MS));
 }
 
+/*
+ * "present" is how the master charger tells this driver to run the pump:
+ * 1 = configure the device and switch it on (2:1 charge pump), 0 = standby.
+ * The input current limit and float voltage must be programmed *before*
+ * enabling - the defaults from DT (3.05A in) are far too much for the battery.
+ */
 static int psy_chg_set_present(struct ln8000_info *info, int val)
 {
     bool usb_present = (bool)val;
@@ -1176,8 +1184,23 @@ static int psy_chg_set_present(struct ln8000_info *info, int val)
         ln_info("changed usb_present [%d] -> [%d]\n", info->usb_present, usb_present);
         if (usb_present) {
             ln8000_init_device(info);
+            /*
+             * ln8000_init_device() programs the DT defaults (input limit
+             * bus_ocp_th - 700mA, i.e. ~3A here) - far more than the battery
+             * may take through a 2:1 pump.  Restore what the master asked
+             * for before the pump is allowed to switch.
+             */
+            if (info->req_vfloat_uv)
+                ln8000_set_vbat_float(info, info->req_vfloat_uv);
+            if (info->req_iin_ua)
+                ln8000_set_iin_limit(info, info->req_iin_ua);
         }
         info->usb_present = usb_present;
+    }
+
+    if (usb_present != info->chg_en) {
+        ln_info("pump enable -> %d\n", usb_present);
+        psy_chg_set_charging_enable(info, usb_present);
     }
 
     return 0;
@@ -1231,9 +1254,11 @@ static int ln8000_charger_set_property(struct power_supply *psy,
         ret = psy_chg_set_present(info, val->intval);
         break;
     case POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE:
+        info->req_vfloat_uv = val->intval;
         ret = ln8000_set_vbat_float(info, val->intval);
         break;
     case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
+        info->req_iin_ua = val->intval;
         ret = ln8000_set_iin_limit(info, val->intval);
         break;
     default:
