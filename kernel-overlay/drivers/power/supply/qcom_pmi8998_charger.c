@@ -2075,9 +2075,16 @@ static int smb2_init_hw(struct smb2_chip *chip)
 		 * ~10V with the input limit collapsed to 100mA and the battery
 		 * discharging, while 5V charges normally.
 		 */
+		/*
+		 * Continuous 5V-9V allowance even though we keep the adapter at
+		 * 5V: with the "5V only" value the PMIC does not run the QC
+		 * handshake and APSD classifies a QC3 charger as a plain DCP, so
+		 * the charge pump could never ask for 9V.  Nothing goes up until
+		 * we request it (no autonomous mode).
+		 */
 		rc = regmap_write(chip->regmap,
 				  chip->base + USBIN_ADAPTER_ALLOW_CFG,
-				  USBIN_ADAPTER_ALLOW_5V);
+				  USBIN_ADAPTER_ALLOW_5V_TO_9V);
 		if (rc < 0)
 			return dev_err_probe(chip->dev, rc,
 					     "failed to set adapter allowance\n");
@@ -2276,7 +2283,11 @@ static void smb2_otg_disable(struct smb2_chip *chip)
  * fall back to plain 5V charging.
  */
 #define SMB2_CP_VFLOAT_UV	4400000		/* 4.40V charge voltage */
-#define SMB2_CP_IIN_UA		1600000		/* 1.6A in -> ~3A into the battery */
+/*
+ * 1.4A input -> ~3.3A into the battery.  1.6A put 3.9A into the pack, above
+ * the vendor's 3.6A battery limit.
+ */
+#define SMB2_CP_IIN_UA		1400000
 #define SMB2_CP_VBUS_MIN_UV	7500000
 #define SMB2_CP_VBUS_MAX_UV	11000000
 #define SMB2_CP_TAPER_UA	300000
@@ -2340,7 +2351,7 @@ static void smb2_cp_restore_5v(struct smb2_chip *chip)
 			   HVDCP_EN_BIT | HVDCP_AUTH_ALG_EN_CFG_BIT |
 			   HVDCP_AUTONOMOUS_MODE_EN_CFG_BIT, 0);
 	regmap_write(chip->regmap, chip->base + USBIN_ADAPTER_ALLOW_CFG,
-		     USBIN_ADAPTER_ALLOW_5V);
+		     USBIN_ADAPTER_ALLOW_5V_TO_9V);
 	regmap_write(chip->regmap, chip->base + CMD_HVDCP_2,
 		     HVDCP_FORCE_5V_BIT);
 
@@ -2544,6 +2555,14 @@ static void smb2_cp_work(struct work_struct *work)
 
 	if (!smb2_batt_get(chip, POWER_SUPPLY_PROP_CURRENT_NOW, &ibat))
 		chip->cp_ibat_ua = ibat;
+
+	/* Hard protection in case the pump's own loop misbehaves. */
+	if (chip->cp_ibat_ua > 4200000) {
+		dev_warn(chip->dev, "cp: battery current %u uA too high\n",
+			 chip->cp_ibat_ua);
+		smb2_cp_stop(chip, "over-current");
+		return;
+	}
 
 	if (!smb2_batt_get(chip, POWER_SUPPLY_PROP_TEMP, &temp) &&
 	    (temp < SMB2_CP_TEMP_MIN || temp > SMB2_CP_TEMP_MAX)) {
