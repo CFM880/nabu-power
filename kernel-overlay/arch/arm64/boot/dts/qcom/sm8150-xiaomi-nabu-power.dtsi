@@ -120,7 +120,13 @@
 		ln8000_charger,tbus-mon-disable;
 		ln8000_charger,tbat-mon-disable;
 		ln8000_charger,iin-ocp-disable;
-		ln8000_charger,iin-reg-disable;
+		/*
+		 * Keep the input-current loop enabled: the vendor DT disables it
+		 * and lets cp_qc30 regulate by tuning VBUS, but then the pump has
+		 * no current limit of its own (measured 3.9A into a 3.6A pack).
+		 * With the loop on, the limit we program is actually honoured.
+		 */
+		/* ln8000_charger,iin-reg-disable; */
 		ln8000_charger,tdie-reg-disable;
 		ln8000_charger,vbat-reg-disable;
 	};
