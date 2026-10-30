@@ -539,6 +539,7 @@ struct smb2_chip {
 	int typec_lost_votes;
 	/* consecutive polls that wanted host, to filter dual-role transients */
 	int typec_host_votes;
+	unsigned int typec_polls;
 	int typec_mode;		/* last Type-C mode written, -1 = none yet */
 	/* 0 = follow CC detection, otherwise force host/device */
 	enum usb_role typec_force;
@@ -675,24 +676,24 @@ static void smb2_otg_disable(struct smb2_chip *chip);
 /*
  * Nabu: apply a Type-C role (host needs the SMB5 5V boost).
  */
-static void smb2_typec_set_mode(struct smb2_chip *chip, enum usb_role role)
+static unsigned int smb2_typec_mode_val(enum usb_role role)
 {
-	u8 val;
-	int rc;
-
 	switch (role) {
 	case USB_ROLE_HOST:
-		val = TYPEC_ROLE_SRC_ONLY;	/* we source VBUS */
-		break;
+		return TYPEC_ROLE_SRC_ONLY;	/* we source VBUS */
 	case USB_ROLE_DEVICE:
-		val = TYPEC_ROLE_SNK_ONLY;
-		break;
+		return TYPEC_ROLE_SNK_ONLY;
 	default:
 		/* automatic: dual role, try sink first so a charger is seen
 		 * immediately and a device is found by the try-source phase */
-		val = TYPEC_ROLE_DRP_TRY_SNK;
-		break;
+		return TYPEC_ROLE_DRP_TRY_SNK;
 	}
+}
+
+static void smb2_typec_set_mode(struct smb2_chip *chip, enum usb_role role)
+{
+	unsigned int val = smb2_typec_mode_val(role);
+	int rc;
 
 	rc = regmap_update_bits(chip->regmap, SMB5_TYPE_C_MODE_CFG,
 				TYPEC_POWER_ROLE_MASK | TYPEC_TRY_MODE_MASK,
@@ -733,10 +734,12 @@ static void smb2_typec_apply_role(struct smb2_chip *chip, enum usb_role role)
 	 * unbalanced disables, and a disable it did not expect can cut VBUS
 	 * under a device that is still attached.
 	 */
-	if (role != chip->typec_role) {
-		if (role == USB_ROLE_HOST)
+	if (role != chip->typec_role && chip->otg_vbus) {
+		bool on = regulator_is_enabled(chip->otg_vbus) > 0;
+
+		if (role == USB_ROLE_HOST && !on)
 			smb2_otg_enable(chip);
-		else
+		else if (role != USB_ROLE_HOST && on)
 			smb2_otg_disable(chip);
 	}
 
@@ -792,7 +795,7 @@ static ssize_t typec_role_store(struct device *dev,
 	smb2_typec_apply_role(chip, role);
 
 	if (role == USB_ROLE_NONE)	/* "auto": start polling CC */
-		schedule_delayed_work(&chip->typec_work, 0);
+		mod_delayed_work(system_wq, &chip->typec_work, 0);
 	else
 		cancel_delayed_work_sync(&chip->typec_work);
 
@@ -840,6 +843,13 @@ static ssize_t typec_regs_show(struct device *dev,
 		len += sysfs_emit_at(buf, len, "%-15s %#04x = %#04x\n",
 				     "OTG_CFG", chip->base + SMB5_DCDC_OTG_CFG, v);
 
+	len += sysfs_emit_at(buf, len,
+			     "%-15s polls=%u role=%d mode=%d force=%d settle=%d votes=%d/%d\n",
+			     "STATE", chip->typec_polls, (int)chip->typec_role,
+			     chip->typec_mode, (int)chip->typec_force,
+			     chip->typec_settle, chip->typec_host_votes,
+			     chip->typec_lost_votes);
+
 	/* adapter detection / charge path, for debugging "not charging" */
 	{
 		static const struct { const char *name; u16 reg; } c[] = {
@@ -856,6 +866,7 @@ static ssize_t typec_regs_show(struct device *dev,
 			{ "BATT_CHG_STS",  BATTERY_CHARGER_STATUS_1 },
 			{ "BATT_CHG_STS2", BATTERY_CHARGER_STATUS_2 },
 			{ "JEITA_EN",      JEITA_EN_CFG },
+			{ NULL, 0 },
 		};
 		int j;
 
@@ -889,9 +900,12 @@ static void smb2_typec_poll(struct work_struct *work)
 	struct smb2_chip *chip =
 		container_of(work, struct smb2_chip, typec_work.work);
 	unsigned int misc = 0;
+
+	chip->typec_polls++;
 	bool attached, present, we_are_source;
 	enum usb_role role, mode;
 	bool changed = false;
+	bool sourcing;
 	int online = 0;
 
 	if (!chip->role_sw) {
@@ -945,16 +959,29 @@ static void smb2_typec_poll(struct work_struct *work)
 	 */
 	smb2_get_prop_usb_online(chip, &online);
 
+	/*
+	 * "Are we the one feeding the port?" - asked from the hardware, not from
+	 * our cached role.  When the boost is on, VBUS reads present because of
+	 * us, so `online` says nothing about a charger; when it is off, VBUS
+	 * means a real source.
+	 */
+	sourcing = chip->otg_vbus && regulator_is_enabled(chip->otg_vbus) > 0;
+
 	if (chip->typec_force != USB_ROLE_NONE) {
 		role = chip->typec_force;
 		mode = role;
-	} else if (online) {
+	} else if (online && !sourcing) {
 		/*
 		 * Somebody is feeding VBUS - a charger or a PC.  Never act as the
 		 * host then: doing so would drive our own 5V into the charger (and
 		 * the charging state would flip-flop).  This also filters the
 		 * dual-role rotation, where the port can misread the same charger
 		 * as a sink for a moment.
+		 *
+		 * While we ARE the host this check has to be skipped: the boost we
+		 * just enabled makes VBUS read present, and acting on that turned
+		 * the port back into a device, cut VBUS to the device we were
+		 * hosting and left the two ends disagreeing.
 		 *
 		 * Stay in dual role rather than pinning the port to sink: the
 		 * Type-C block has to keep its own CC state machine running for
@@ -965,7 +992,7 @@ static void smb2_typec_poll(struct work_struct *work)
 		role = USB_ROLE_DEVICE;
 		mode = USB_ROLE_NONE;
 		chip->typec_host_votes = 0;
-	} else if (chip->typec_role == USB_ROLE_HOST) {
+	} else if (sourcing) {
 		/*
 		 * Sourcing VBUS for a device: stay there until it is really gone.
 		 * The vendor's PD stack behaves the same way - the role is set
@@ -974,18 +1001,29 @@ static void smb2_typec_poll(struct work_struct *work)
 		 * headset drop off (the CC status blips to "no attach" now and
 		 * then even though the device is still there).
 		 */
-		if (present) {
+		/*
+		 * Fall through to apply even while nothing changed: the USB role
+		 * switch is only told about a role when this block runs, and a
+		 * poll that returned early here left the controller in peripheral
+		 * mode while the port was still sourcing 5V - the device had power
+		 * but never enumerated.
+		 */
+		if (present)
 			chip->typec_lost_votes = 0;
-			goto out;		/* still there: keep hosting */
-		}
-		if (++chip->typec_lost_votes < 5)
-			goto out;		/* a CC blip, not a detach */
+		else if (++chip->typec_lost_votes < 5)
+			;		/* a CC blip, keep hosting */
 
-		/* Really gone: drop the boost and go back to dual role, so a
-		 * charger plugged in next is detected normally. */
-		chip->typec_lost_votes = 0;
-		role = USB_ROLE_DEVICE;
-		mode = USB_ROLE_NONE;
+		if (chip->typec_lost_votes >= 5) {
+			/* Really gone: drop the boost and go back to dual role, so
+			 * a charger plugged in next is detected normally. */
+			chip->typec_lost_votes = 0;
+			chip->typec_host_votes = 0;
+			role = USB_ROLE_DEVICE;
+			mode = USB_ROLE_NONE;
+		} else {
+			role = USB_ROLE_HOST;
+			mode = USB_ROLE_HOST;
+		}
 	} else if (attached && we_are_source) {
 		/*
 		 * A sink is on the port (stick, headset, keyboard): we have to be
@@ -993,13 +1031,11 @@ static void smb2_typec_poll(struct work_struct *work)
 		 * single sample taken mid dual-role rotation cannot turn the port
 		 * around by mistake.
 		 */
-		if (++chip->typec_host_votes < 2) {
-			role = chip->typec_role;
-			mode = chip->typec_mode;
-			goto apply;
-		}
+		if (++chip->typec_host_votes < 2)
+			goto out;		/* ask once more before turning */
 		role = USB_ROLE_HOST;
 		mode = USB_ROLE_HOST;
+		chip->typec_host_votes = 0;
 		chip->typec_lost_votes = 0;
 	} else if (attached) {
 		/*
@@ -1018,16 +1054,59 @@ static void smb2_typec_poll(struct work_struct *work)
 	}
 
 apply:
-	if ((int)mode != chip->typec_mode) {
-		smb2_typec_set_mode(chip, mode);
-		chip->typec_mode = (int)mode;
-		chip->typec_settle = 2;
+	if (role != chip->typec_role || (int)mode != chip->typec_mode)
+		dev_info(chip->dev,
+			 "typec: decide role=%d mode=%d (attached=%d present=%d we_are_source=%d online=%d sourcing=%d misc=%#x)\n",
+			 role, mode, attached, present, we_are_source, online,
+			 sourcing, misc);
+
+	/*
+	 * Trust the hardware, not the cache: the Type-C block latches its own
+	 * role bits when a partner attaches, so the register can disagree with
+	 * what we last wrote.  Re-program it whenever the readback does not
+	 * match the decision.
+	 */
+	{
+		unsigned int has = 0;
+		unsigned int want = smb2_typec_mode_val(mode);
+		bool mismatch = !regmap_read(chip->regmap,
+					     SMB5_TYPE_C_MODE_CFG, &has) &&
+				((has & (TYPEC_POWER_ROLE_MASK |
+					 TYPEC_TRY_MODE_MASK)) != want);
+
+		if ((int)mode != chip->typec_mode || mismatch) {
+			smb2_typec_set_mode(chip, mode);
+			chip->typec_mode = (int)mode;
+			chip->typec_settle = 2;
+		}
 	}
 
-	if (role != chip->typec_role || chip->typec_settle) {
+	/* Same for the boost: it must follow the decision. */
+	if (chip->otg_vbus) {
+		bool on = regulator_is_enabled(chip->otg_vbus) > 0;
+
+		if (mode == USB_ROLE_HOST && !on)
+			smb2_otg_enable(chip);
+		else if (mode != USB_ROLE_HOST && on)
+			smb2_otg_disable(chip);
+	}
+
+	{
 		enum usb_role prev = chip->typec_role;
 
-		smb2_typec_apply_role(chip, role);
+		if (role != chip->typec_role) {
+			dev_info(chip->dev, "typec: role %d -> %d\n",
+				 chip->typec_role, role);
+			chip->typec_settle = 2;
+		}
+
+		/* dwc3 drops the first request after boot; settle repeats it */
+		if (chip->role_sw &&
+		    (role != chip->typec_role || chip->typec_settle))
+			usb_role_switch_set_role(chip->role_sw, role);
+
+		/* Cache follows the decision unconditionally - a stale cache is
+		 * what left the port hosting with the boost off before. */
 		chip->typec_role = role;
 		if (chip->typec_settle)
 			chip->typec_settle--;
@@ -1057,6 +1136,14 @@ out:
 			    chip->typec_lost_votes > 0 ||
 			    changed || chip->typec_settle ||
 			    /*
+			     * While we are sourcing, the Type-C block does not report
+			     * a sink detach on CC, so keep looking once a second or an
+			     * unplug goes unnoticed for the whole 30s safety net and
+			     * the next charger is not picked up.  Hosting is a
+			     * transient state, so this costs little.
+			     */
+			    sourcing ||
+			    /*
 			     * A sink is on the port but VBUS still reads
 			     * present (it decays for a moment after a charger is
 			     * pulled).  Keep looking closely so host mode is
@@ -1068,7 +1155,7 @@ out:
 				       msecs_to_jiffies(SMB2_TYPEC_POLL_MS_BUSY) :
 				       msecs_to_jiffies(SMB2_TYPEC_POLL_MS);
 
-		schedule_delayed_work(&chip->typec_work, delay);
+		mod_delayed_work(system_wq, &chip->typec_work, delay);
 	}
 }
 
@@ -1664,7 +1751,7 @@ static irqreturn_t smb2_handle_typec_irq(int irq, void *data)
 {
 	struct smb2_chip *chip = data;
 
-	schedule_delayed_work(&chip->typec_work, 0);
+	mod_delayed_work(system_wq, &chip->typec_work, 0);
 
 	return IRQ_HANDLED;
 }
