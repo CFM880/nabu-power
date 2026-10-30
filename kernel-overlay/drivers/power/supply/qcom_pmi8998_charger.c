@@ -303,6 +303,12 @@
 #define USBIN_ADAPTER_ALLOW_CFG				0x360
 #define USBIN_ADAPTER_ALLOW_5V				0
 #define USBIN_ADAPTER_ALLOW_5V_OR_9V			3
+/*
+ * Continuous 5V-9V range, like the vendor driver.  With the discrete
+ * "5V or 9V" setting the PMIC treated the QC adapter's 9.06V as USBIN
+ * over-voltage and held ICL at 0, so nothing charged at 9V.
+ */
+#define USBIN_ADAPTER_ALLOW_5V_TO_9V			8
 #define USBIN_ADAPTER_ALLOW_5V_TO_12V			12
 
 #define CMD_HVDCP_2					0x343
@@ -1604,9 +1610,9 @@ static void smb2_jeita_work(struct work_struct *work)
 					       &val))
 			cur = val.intval;
 
-		if (cap >= 100 && cur < 400000)
+		if (cap >= 100 && cur < 400000 && cur > -200000)
 			full = true;
-		else if (cap <= 98 || cur >= 500000)
+		else if (cap <= 98 || cur >= 500000 || cur <= -200000)
 			full = false;
 
 		if (full != chip->charge_full) {
@@ -1847,7 +1853,13 @@ static const struct power_supply_desc smb2_psy_desc = {
 
 /* Init sequence derived from vendor downstream driver */
 static const struct smb2_register smb2_init_seq[] = {
-	{ .addr = AICL_RERUN_TIME_CFG, .mask = AICL_RERUN_TIME_MASK, .val = 0 },
+	/*
+	 * Re-run AICL every 12s (vendor value).  With a rerun time of 0 the
+	 * first AICL result stuck: after boot with an adapter attached it
+	 * settled at 250-350mA - less than the system load - and the battery
+	 * drained while "charging".
+	 */
+	{ .addr = AICL_RERUN_TIME_CFG, .mask = AICL_RERUN_TIME_MASK, .val = 0x1 },
 	/*
 	 * By default configure us as an upstream facing port
 	 * FIXME: This will be handled by the type-c driver
@@ -1929,8 +1941,14 @@ static const struct smb2_register smb2_init_seq[] = {
 		  USBIN_AICL_EN_BIT | SUSPEND_ON_COLLAPSE_USBIN_BIT |
 		  USBIN_HV_COLLAPSE_RESPONSE_BIT |
 		  USBIN_LV_COLLAPSE_RESPONSE_BIT,
-	  .val = USBIN_HV_COLLAPSE_RESPONSE_BIT |
-		 USBIN_LV_COLLAPSE_RESPONSE_BIT | USBIN_AICL_EN_BIT },
+	  /*
+	   * USBIN_{HV,LV}_COLLAPSE_RESPONSE are PMI8998 bits; the vendor
+	   * PM8150B (smb5) driver never sets them, and with them set AICL
+	   * stops at 250mA (measured: 0x57 -> ICL 250mA and the battery
+	   * draining on a 3A charger, 0x54 -> ICL 1.75A and +1.1A into it).
+	   * The mask above clears them on purpose.
+	   */
+	  .val = USBIN_AICL_EN_BIT },
 	/*
 	 * Set pre charge current to default, the OnePlus 6 bootloader
 	 * sets this very conservatively.
@@ -2392,7 +2410,7 @@ static int smb2_cp_start(struct smb2_chip *chip)
 			   HVDCP_EN_BIT | HVDCP_AUTH_ALG_EN_CFG_BIT |
 			   HVDCP_AUTONOMOUS_MODE_EN_CFG_BIT);
 	regmap_write(chip->regmap, chip->base + USBIN_ADAPTER_ALLOW_CFG,
-		     USBIN_ADAPTER_ALLOW_5V_OR_9V);
+		     USBIN_ADAPTER_ALLOW_5V_TO_9V);
 
 	/*
 	 * Ask for high voltage.  Let the PMIC's autonomous HVDCP mode raise it

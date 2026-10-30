@@ -370,7 +370,7 @@ do {                                    \
 
 #define ln_dbg(fmt, ...)                \
 do {                                    \
-        printk(KERN_DEBUG "ln8000@pri: %s: " fmt, __func__, ##__VA_ARGS__); \
+        pr_debug("ln8000@pri: %s: " fmt, __func__, ##__VA_ARGS__); \
 } while (0);
 
 #define LN8000_REG_PRINT(reg_addr, val)                         \
@@ -1774,28 +1774,32 @@ static void ln8000_remove(struct i2c_client *client)
 {
     struct ln8000_info *info = i2c_get_clientdata(client);
 
-    if (info->typec_psy)
+    /*
+     * info, pdata, the regmap, the IRQ and the power supply are all
+     * devm-managed, so unloading used to free them twice (free_irq warning,
+     * double power_supply_unregister, double kfree) and left the Type-C
+     * notifier registered plus its reference leaked.
+     */
+    if (info->typec_psy) {
+        power_supply_unreg_notifier(&info->nb);
+        cancel_delayed_work_sync(&info->status_changed_work);
+        cancel_delayed_work_sync(&info->charge_work);
         cancel_delayed_work_sync(&info->thermal_work);
+    }
+    if (client->irq)
+        cancel_delayed_work_sync(&info->vac_ov_work);
+
     ln8000_change_opmode(info, LN8000_OPMODE_STANDBY);
 
-    if (client->irq) {
-       free_irq(client->irq, info);
-       if (info->pdata->irq_gpio) {
-           gpiod_put(info->pdata->irq_gpio);
-       }
-    }
+    if (info->pdata->irq_gpio)
+        gpiod_put(info->pdata->irq_gpio);
 
-    power_supply_unregister(info->psy_chg);
-    i2c_set_clientdata(info->client, NULL);
+    if (info->typec_psy)
+        power_supply_put(info->typec_psy);
 
     mutex_destroy(&info->data_lock);
     mutex_destroy(&info->i2c_lock);
     mutex_destroy(&info->irq_lock);
-
-    kfree(info->pdata);
-    kfree(info);
-
-    return;
 }
 
 static void ln8000_shutdown(struct i2c_client *client)
