@@ -2355,6 +2355,10 @@ static void smb2_cp_restore_5v(struct smb2_chip *chip)
 	regmap_write(chip->regmap, chip->base + CMD_HVDCP_2,
 		     HVDCP_FORCE_5V_BIT);
 
+	/* The QC ramp leaves the input limit collapsed (100mA measured);
+	 * restore a full DCP budget so the buck actually charges again. */
+	smb2_set_current_limit(chip, chip->is_smb5 ? 3000000 : DCP_CURRENT_UA);
+
 	/* re-classify at 5V: the QC attempt above leaves APSD stale */
 	regmap_update_bits(chip->regmap, chip->base + CMD_APSD,
 			   APSD_RERUN_BIT, APSD_RERUN_BIT);
@@ -2793,7 +2797,15 @@ static int smb2_probe(struct platform_device *pdev)
 		smb2_typec_init(chip);
 		INIT_DELAYED_WORK(&chip->typec_work, smb2_typec_poll);
 		INIT_DELAYED_WORK(&chip->cp_work, smb2_cp_work);
-		chip->cp_auto = true;
+		/*
+		 * Do not start the LN8000 charge pump on our own.  On a plain
+		 * DCP 5V adapter the pump cannot bring VBUS up to 9V, and each
+		 * failed attempt re-runs APSD; the loop leaves the input limit
+		 * collapsed to 100mA and the tablet discharges while "charging"
+		 * (measured).  The pump stays available through the cp_enable
+		 * attribute for adapters that can do 9V.
+		 */
+		chip->cp_auto = false;
 		/* Automatic role detection is a 2 s poll.  The old "no polling"
 		 * default existed only because the Type-C registers were read at
 		 * the wrong address; with that fixed the poll is what makes the
@@ -2884,11 +2896,35 @@ static const struct of_device_id smb2_match_id_table[] = {
 };
 MODULE_DEVICE_TABLE(of, smb2_match_id_table);
 
+/*
+ * The charger state machine does not survive a system suspend well: after a
+ * few cycles the input limit can stay collapsed and the tablet discharges
+ * while reporting "Charging".  Re-run the detection on resume.
+ */
+static int smb2_resume(struct device *dev)
+{
+	struct smb2_chip *chip = dev_get_drvdata(dev);
+
+	if (!chip)
+		return 0;
+
+	chip->cp_failed = false;
+	schedule_delayed_work(&chip->status_change_work,
+			      msecs_to_jiffies(200));
+
+	return 0;
+}
+
+static const struct dev_pm_ops smb2_pm_ops = {
+	.resume = smb2_resume,
+};
+
 static struct platform_driver qcom_spmi_smb2 = {
 	.probe = smb2_probe,
 	.driver = {
 		.name = "qcom-pmi8998/pm660-charger",
 		.of_match_table = smb2_match_id_table,
+		.pm = &smb2_pm_ops,
 		},
 };
 
