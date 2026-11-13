@@ -1033,8 +1033,9 @@ static void smb2_typec_poll(struct work_struct *work)
 		 */
 		if (present)
 			chip->typec_lost_votes = 0;
-		else if (++chip->typec_lost_votes < 5)
-			;		/* a CC blip, keep hosting */
+		else if (++chip->typec_lost_votes < 5) {
+			/* a CC blip, keep hosting */
+		}
 
 		if (chip->typec_lost_votes >= 5) {
 			/* Really gone: drop the boost and go back to dual role, so
@@ -1076,7 +1077,6 @@ static void smb2_typec_poll(struct work_struct *work)
 		chip->typec_lost_votes = 0;
 	}
 
-apply:
 	if (role != chip->typec_role || (int)mode != chip->typec_mode)
 		dev_info(chip->dev,
 			 "typec: decide role=%d mode=%d (attached=%d present=%d we_are_source=%d online=%d sourcing=%d misc=%#x)\n",
@@ -2334,16 +2334,6 @@ static int smb2_batt_get(struct smb2_chip *chip, enum power_supply_property p,
 	return 0;
 }
 
-static bool smb2_apsd_qc_capable(struct smb2_chip *chip)
-{
-	unsigned int res = 0;
-
-	if (regmap_read(chip->regmap, chip->base + APSD_RESULT_STATUS, &res))
-		return false;
-
-	return !!(res & (QC_3P0_BIT | QC_2P0_BIT));
-}
-
 static void smb2_cp_restore_5v(struct smb2_chip *chip)
 {
 	/* HVDCP off again: plain 5V charging, no QC negotiation */
@@ -2830,10 +2820,18 @@ static int smb2_probe(struct platform_device *pdev)
 			int irq = platform_get_irq_byname_optional(pdev,
 								   names[tci]);
 
-			if (irq > 0)
-				devm_request_threaded_irq(chip->dev, irq, NULL,
-					smb2_handle_typec_irq,
-					IRQF_ONESHOT, names[tci], chip);
+			int ret;
+
+			if (irq <= 0)
+				continue;
+			ret = devm_request_threaded_irq(chip->dev, irq, NULL,
+							smb2_handle_typec_irq,
+							IRQF_ONESHOT,
+							names[tci], chip);
+			if (ret)
+				dev_warn(chip->dev,
+					 "typec: cannot request %s irq: %d\n",
+					 names[tci], ret);
 		}
 	}
 
