@@ -206,6 +206,17 @@ struct qcom_fg_chip {
 	int last_status;	/* to detect the charge-full transition */
 	struct delayed_work status_changed_work;
 
+	/*
+	 * nabu: coulomb-counted state of charge.  The gauge's own SOC words are
+	 * not usable on this PMIC (PM8150B), so integrate the current locally
+	 * and use the hardware monotonic SOC as the long-term anchor.  This also
+	 * gives charge_now at uAh resolution, which the 1 % capacity lacks.
+	 */
+	s32 charge_now_uah;
+	s64 soc_last_ns;
+	int soc_pct;
+	struct delayed_work soc_work;
+
 	struct completion sram_access_granted;
 	struct completion sram_access_revoked;
 	struct workqueue_struct *sram_wq;
@@ -214,6 +225,9 @@ struct qcom_fg_chip {
 	spinlock_t sram_rw_lock;
 	int sram_requests;
 };
+
+static int qcom_fg_get_capacity_hw(struct qcom_fg_chip *chip, int *val);
+static s32 qcom_fg_design_uah(struct qcom_fg_chip *chip);
 
 /************************
  * IO FUNCTIONS
@@ -1190,6 +1204,11 @@ static enum power_supply_property qcom_fg_props[] = {
 	POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN,
 	POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN,
 	POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
+	POWER_SUPPLY_PROP_CHARGE_NOW,
+	POWER_SUPPLY_PROP_CHARGE_FULL,
+	POWER_SUPPLY_PROP_ENERGY_NOW,
+	POWER_SUPPLY_PROP_ENERGY_FULL,
+	POWER_SUPPLY_PROP_HEALTH,
 	POWER_SUPPLY_PROP_PRESENT,
 	POWER_SUPPLY_PROP_TEMP,
 	POWER_SUPPLY_PROP_TEMP_MIN,
@@ -1255,8 +1274,10 @@ static int qcom_fg_get_property(struct power_supply *psy,
 		if (chip->chg_psy &&
 		    chip->status == POWER_SUPPLY_STATUS_FULL)
 			val->intval = 100;
+		else if (chip->soc_pct >= 0)
+			val->intval = chip->soc_pct;
 		else
-			ret = chip->ops->get_capacity(chip, &val->intval);
+			ret = qcom_fg_get_capacity_hw(chip, &val->intval);
 		break;
 	case POWER_SUPPLY_PROP_CURRENT_NOW:
 		ret = chip->ops->get_current(chip, &val->intval);
@@ -1280,6 +1301,25 @@ static int qcom_fg_get_property(struct power_supply *psy,
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
 		val->intval = chip->batt_info->charge_full_design_uah;
+		break;
+	case POWER_SUPPLY_PROP_CHARGE_NOW:
+		val->intval = chip->charge_now_uah;
+		break;
+	case POWER_SUPPLY_PROP_CHARGE_FULL:
+		val->intval = qcom_fg_design_uah(chip);
+		break;
+	case POWER_SUPPLY_PROP_ENERGY_NOW:
+		/*
+		 * Use the same nominal voltage as ENERGY_FULL, otherwise a full
+		 * pack at 4.4 V reports more energy than ENERGY_FULL.
+		 */
+		val->intval = (s64)chip->charge_now_uah * 3850000 / 1000000;
+		break;
+	case POWER_SUPPLY_PROP_ENERGY_FULL:
+		val->intval = (s64)qcom_fg_design_uah(chip) * 3850000 / 1000000;
+		break;
+	case POWER_SUPPLY_PROP_HEALTH:
+		val->intval = POWER_SUPPLY_HEALTH_GOOD;
 		break;
 	case POWER_SUPPLY_PROP_PRESENT:
 		val->intval = 1;
@@ -1978,6 +2018,87 @@ static int qcom_fg_gen4_write_esr_thresh(struct qcom_fg_chip *chip)
  * charge advance ~1.7x faster than the charge actually going in while
  * discharge stayed close to accurate (measured 2026-10-28).
  */
+#define NABU_SOC_PERIOD_MS	30000
+#define NABU_SOC_REST_UA	50000	/* |I| below this counts as at rest */
+
+static int qcom_fg_get_capacity_hw(struct qcom_fg_chip *chip, int *val)
+{
+	return chip->ops->get_capacity(chip, val);
+}
+
+static s32 qcom_fg_design_uah(struct qcom_fg_chip *chip)
+{
+	if (chip->batt_info && chip->batt_info->charge_full_design_uah > 0)
+		return chip->batt_info->charge_full_design_uah;
+
+	return 8720000;		/* nabu: 8720 mAh */
+}
+
+/*
+ * nabu: integrate the battery current every 30 s and pull the result back
+ * towards the gauge's monotonic SOC, quickly when the battery rests and gently
+ * otherwise.  Skipping the integration when the elapsed time is large keeps a
+ * suspend from being counted with the wrong (post-resume) current; the anchor
+ * covers that gap because the gauge keeps counting in hardware.
+ */
+static void qcom_fg_soc_update(struct qcom_fg_chip *chip)
+{
+	s64 now = ktime_get_boottime_ns();
+	s64 dt_ns = now - chip->soc_last_ns;
+	s32 design = qcom_fg_design_uah(chip);
+	int cur_ua = 0, hw_pct = 0;
+	s32 target, step;
+
+	chip->soc_last_ns = now;
+
+	if (dt_ns > 0 && dt_ns <= 120 * NSEC_PER_SEC &&
+	    !chip->ops->get_current(chip, &cur_ua)) {
+		/* get_current() reports positive while discharging */
+		chip->charge_now_uah -=
+			(s32)((s64)cur_ua * dt_ns / (3600LL * NSEC_PER_SEC));
+	}
+
+	if (qcom_fg_get_capacity_hw(chip, &hw_pct)) {
+		hw_pct = chip->soc_pct >= 0 ? chip->soc_pct : 50;
+	}
+
+	target = (s32)((s64)design * clamp(hw_pct, 0, 100) / 100);
+	step = abs(cur_ua) < NABU_SOC_REST_UA ? 8 : 32;
+	chip->charge_now_uah += (target - chip->charge_now_uah) / step;
+	chip->charge_now_uah = clamp(chip->charge_now_uah, 0, design);
+
+	chip->soc_pct = DIV_ROUND_CLOSEST((s64)chip->charge_now_uah * 100,
+					  design);
+	chip->soc_pct = clamp(chip->soc_pct, 0, 100);
+}
+
+static void qcom_fg_soc_work(struct work_struct *work)
+{
+	struct qcom_fg_chip *chip = container_of(to_delayed_work(work),
+						 struct qcom_fg_chip, soc_work);
+
+	qcom_fg_soc_update(chip);
+	schedule_delayed_work(&chip->soc_work,
+			      msecs_to_jiffies(NABU_SOC_PERIOD_MS));
+}
+
+static void qcom_fg_soc_init(struct qcom_fg_chip *chip)
+{
+	s32 design = qcom_fg_design_uah(chip);
+	int pct = 50;
+
+	if (qcom_fg_get_capacity_hw(chip, &pct))
+		pct = 50;
+
+	chip->soc_pct = clamp(pct, 0, 100);
+	chip->charge_now_uah = (s32)((s64)design * chip->soc_pct / 100);
+	chip->soc_last_ns = ktime_get_boottime_ns();
+
+	INIT_DELAYED_WORK(&chip->soc_work, qcom_fg_soc_work);
+	schedule_delayed_work(&chip->soc_work,
+			      msecs_to_jiffies(NABU_SOC_PERIOD_MS));
+}
+
 static int qcom_fg_gen4_write_ki_threshs(struct qcom_fg_chip *chip)
 {
 	struct device_node *np = chip->dev->of_node;
@@ -2271,12 +2392,16 @@ static int qcom_fg_probe(struct platform_device *pdev)
 				 ret);
 	}
 
+	qcom_fg_soc_init(chip);
+
 	return 0;
 }
 
 static void qcom_fg_remove(struct platform_device *pdev)
 {
 	struct qcom_fg_chip *chip = platform_get_drvdata(pdev);
+
+	cancel_delayed_work_sync(&chip->soc_work);
 
 	power_supply_put_battery_info(chip->batt_psy, chip->batt_info);
 
