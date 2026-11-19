@@ -69,6 +69,18 @@ KI 系数、截止/终止电流和空电电压写入燃料计 SRAM，并重启�
 SMB5 结束涓流充满（`POWER_SUPPLY_STATUS_FULL`）时 `capacity` 上报 100%，
 燃料计空电端点上报 0%，中间 1..99 由单调 SOC 缩放得到。
 
+## 睡眠模式与充电器
+
+插着充电器时平台 `mem`（深睡）不可用：整机会在 `PM: suspend entry (deep)` 之后死在
+platform suspend 路径里，要么自己重启、要么只能长按电源 15 秒。`s2idle` 在 AC 下稳定，
+而插电时本来就没有待机省电需求，因此 `bin/nabu-mem-sleep`（安装为
+`/usr/local/libexec/nabu-mem-sleep`）根据充电器状态选择睡眠模式，由
+`config/60-nabu-mem-sleep.rules` 在 USB 电源的 `online` 变化时触发：充电时 `s2idle`，
+电池时 `deep`（实测约 1%/h）。
+
+已验证：拔掉 → `s2idle [deep]`，插上 → `[s2idle] deep`，均由 udev 事件自动完成，无需手工操作。
+根因定位过程见 `nabu-linux-overlay/docs/KNOWN-ISSUES.md` 2.5。
+
 ## 目录
 
 ```text

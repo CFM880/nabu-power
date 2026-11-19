@@ -1,0 +1,40 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# nabu-mem-sleep - pick the system sleep mode from the charger state.
+#
+# Platform "mem" (deep) suspend does not survive a charger being attached on
+# this board: the machine dies in the platform suspend path - it either reboots
+# or never resumes and needs a 15 s power-button reset.  s2idle is reliable on
+# AC, and AC has no standby power budget to save, so use it there.  On battery
+# the deep state is the one that sleeps at ~1 %/h.
+#
+# Called from 60-nabu-mem-sleep.rules on the USB power supply's online
+# transitions.  Details: nabu-linux-overlay/docs/KNOWN-ISSUES.md 2.5.
+
+set -u
+
+online=0
+for ps in /sys/class/power_supply/*; do
+	[ -r "$ps/type" ] || continue
+	[ "$(cat "$ps/type" 2>/dev/null)" = "USB" ] || continue
+	if [ "$(cat "$ps/online" 2>/dev/null)" = "1" ]; then
+		online=1
+	fi
+done
+
+if [ "$online" = 1 ]; then
+	mode=s2idle
+else
+	mode=deep
+fi
+
+[ -w /sys/power/mem_sleep ] || exit 0
+
+case " $(cat /sys/power/mem_sleep) " in
+*"[$mode]"*)
+	exit 0		# already selected
+	;;
+esac
+
+echo "$mode" > /sys/power/mem_sleep

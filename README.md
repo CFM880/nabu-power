@@ -75,6 +75,19 @@ loaded the reported percentage tracks the battery across the whole 0..100% range
 `capacity` reports 100% once the pack is full and 0% at the gauge's empty endpoint; the 1..99 range
 in between is scaled from the gauge's monotonic SOC.
 
+## Sleep mode and the charger
+
+Platform `mem` (deep) suspend does not survive with a charger attached: the tablet dies inside
+the platform suspend path right after `PM: suspend entry (deep)` and either reboots or needs a
+15 s power-button reset. `s2idle` is reliable on AC, and AC needs no standby savings, so
+`bin/nabu-mem-sleep` (installed as `/usr/local/libexec/nabu-mem-sleep`) picks the mode from the
+charger state, driven by `config/60-nabu-mem-sleep.rules` on the USB power supply's `online`
+transitions: `s2idle` while charging, `deep` on battery (measured ~1 %/h).
+
+Verified: unplug → `s2idle [deep]`, plug → `[s2idle] deep`, at the udev event, with no manual
+step. Details and the measurements that localised the hang: `nabu-linux-overlay/docs/KNOWN-ISSUES.md`
+2.5.
+
 ## Layout
 
 ```text
