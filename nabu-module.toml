@@ -10,7 +10,6 @@ overlay  = "kernel-overlay"
 dtsi     = ["arch/arm64/boot/dts/qcom/sm8150-xiaomi-nabu-power.dtsi"]
 config   = ["config/nabu-power.config"]
 systemd  = ["system/ln8000-autoload.service"]
-rules    = ["config/60-nabu-mem-sleep.rules"]
 
 [build]
 kernel_targets = ["drivers/power/supply/ln8000_charger.ko"]
@@ -22,5 +21,3 @@ kernel_targets = ["drivers/power/supply/ln8000_charger.ko"]
 "ln8000_charger.ko"                  = "/lib/modules/@release@/kernel/drivers/power/supply/ln8000_charger.ko"
 "systemd/ln8000-autoload.service"    = "/etc/systemd/system/ln8000-autoload.service"
 "bin/nabu-typec"                     = "/usr/local/bin/nabu-typec"
-"bin/nabu-mem-sleep"                 = "/usr/local/libexec/nabu-mem-sleep"
-"rules/60-nabu-mem-sleep.rules"      = "/etc/udev/rules.d/60-nabu-mem-sleep.rules"

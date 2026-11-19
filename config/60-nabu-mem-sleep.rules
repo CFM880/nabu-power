@@ -1,9 +1,0 @@
-# SPDX-License-Identifier: GPL-2.0-only
-#
-# Platform "mem" (deep) suspend hangs while a charger is attached: the tablet
-# dies inside the platform suspend path and either reboots or needs a 15 s
-# power-button reset (nabu-linux-overlay/docs/KNOWN-ISSUES.md 2.5).  s2idle
-# survives AC; deep sleep on battery still gives the ~1 %/h standby drain.
-# Pick the mode from the charger state instead of leaving it fixed.
-SUBSYSTEM=="power_supply", ENV{POWER_SUPPLY_TYPE}=="USB", ENV{POWER_SUPPLY_ONLINE}=="1", RUN+="/usr/local/libexec/nabu-mem-sleep"
-SUBSYSTEM=="power_supply", ENV{POWER_SUPPLY_TYPE}=="USB", ENV{POWER_SUPPLY_ONLINE}=="0", RUN+="/usr/local/libexec/nabu-mem-sleep"

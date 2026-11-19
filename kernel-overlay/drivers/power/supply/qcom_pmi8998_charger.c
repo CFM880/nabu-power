@@ -2948,9 +2948,19 @@ static int smb2_probe(struct platform_device *pdev)
 		}
 	}
 
-	rc = dev_pm_set_wake_irq(chip->dev, chip->cable_irq);
-	if (rc < 0)
-		return dev_err_probe(chip->dev, rc, "Couldn't set wake irq\n");
+	/*
+	 * Register the device as a wakeup source and arm the cable IRQ by
+	 * hand in .suspend.
+	 *
+	 * dev_pm_set_wake_irq() leaves the arming to the PM core, which does
+	 * it in the noirq phase (device_wakeup_arm_wake_irqs()).  With a
+	 * charger attached that hangs the machine: pm_test=platform passes on
+	 * battery and dies on AC, and it passes on AC once this driver is
+	 * unbound.  Arming an SPMI-backed IRQ that early is what stalls - the
+	 * PMIC bus is partly gated by then.  .suspend runs with a healthy bus
+	 * and is the phase the pwrkey driver uses for the same reason.
+	 */
+	device_init_wakeup(chip->dev, true);
 
 	platform_set_drvdata(pdev, chip);
 
@@ -3095,12 +3105,30 @@ MODULE_DEVICE_TABLE(of, smb2_match_id_table);
  * few cycles the input limit can stay collapsed and the tablet discharges
  * while reporting "Charging".  Re-run the detection on resume.
  */
+static int smb2_suspend(struct device *dev)
+{
+	struct smb2_chip *chip = dev_get_drvdata(dev);
+
+	if (!chip || !device_may_wakeup(dev))
+		return 0;
+
+	/*
+	 * Arm the plug IRQ here, not in noirq: the PMIC bus is still healthy
+	 * in the device phase, and this keeps dev_pm_set_wake_irq()'s noirq
+	 * arming (which hangs the board on AC) out of the picture.
+	 */
+	return enable_irq_wake(chip->cable_irq);
+}
+
 static int smb2_resume(struct device *dev)
 {
 	struct smb2_chip *chip = dev_get_drvdata(dev);
 
 	if (!chip)
 		return 0;
+
+	if (device_may_wakeup(dev))
+		disable_irq_wake(chip->cable_irq);
 
 	chip->cp_failed = false;
 	schedule_delayed_work(&chip->status_change_work,
@@ -3110,6 +3138,7 @@ static int smb2_resume(struct device *dev)
 }
 
 static const struct dev_pm_ops smb2_pm_ops = {
+	.suspend = smb2_suspend,
 	.resume = smb2_resume,
 };
 
