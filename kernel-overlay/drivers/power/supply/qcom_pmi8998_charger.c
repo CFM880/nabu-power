@@ -586,6 +586,7 @@ struct smb2_chip {
 	int apsd_retries;
 	int online_retries;
 	bool charge_full;
+	unsigned int fake_chg_retries;
 	/* last values written to the hardware, to avoid pointless rewrites */
 	unsigned int last_fcc_ua;
 	unsigned int last_fv_uv;
@@ -1359,6 +1360,19 @@ static int smb2_set_current_limit(struct smb2_chip *chip, unsigned int val)
 	if (rc)
 		return rc;
 
+	/*
+	 * The USBIN input FET is left suspended by the PMIC default state.
+	 * With it suspended the charger state machine still reports a charge
+	 * phase ("Charging") while the input draws no current and the pack
+	 * discharges (measured: VBUS 4.99 V, ICL request 3 A, battery
+	 * -373 mA).  The vendor driver always unsuspends the input after
+	 * programming the ICL; do the same here.
+	 */
+	rc = regmap_update_bits(chip->regmap, chip->base + USBIN_CMD_IL,
+				USBIN_SUSPEND_BIT, 0);
+	if (rc)
+		return rc;
+
 	if (val > 500000) {
 		/*
 		 * High-current mode: honour the value above instead of the
@@ -1372,14 +1386,29 @@ static int smb2_set_current_limit(struct smb2_chip *chip, unsigned int val)
 					ICL_OVERRIDE_AFTER_APSD_BIT);
 		if (rc)
 			return rc;
+		/*
+		 * Force the software limit.  With only ICL_OVERRIDE_AFTER_APSD
+		 * the hardware keeps the APSD-computed limit whenever the
+		 * result carries no ICL_OVERRIDE_LATCH - which is every fresh
+		 * DCP plug (APSD_RESULT 0x08 instead of 0x48).  Measured in
+		 * that state: ICL_STATUS 100 mA while this register asks for
+		 * 3000 mA, battery -825 mA, status "Charging".  Setting the
+		 * override makes the hardware use the value below within one
+		 * sample (ICL_STATUS 0x3c, battery +2.48 A).
+		 */
 		rc = regmap_update_bits(chip->regmap,
 					chip->base + CMD_ICL_OVERRIDE,
-					ICL_OVERRIDE_CMD_BIT, 0);
+					ICL_OVERRIDE_CMD_BIT,
+					ICL_OVERRIDE_CMD_BIT);
 	} else {
 		/* Back to hardware auto for the low-current cases. */
 		rc = regmap_update_bits(chip->regmap,
 					chip->base + USBIN_LOAD_CFG,
 					ICL_OVERRIDE_AFTER_APSD_BIT, 0);
+		if (!rc)
+			rc = regmap_update_bits(chip->regmap,
+					chip->base + CMD_ICL_OVERRIDE,
+					ICL_OVERRIDE_CMD_BIT, 0);
 	}
 
 	return rc;
@@ -1570,6 +1599,7 @@ static void smb2_jeita_work(struct work_struct *work)
 	union power_supply_propval val;
 	struct power_supply *batt_psy;
 	int usb_online = 0, temp, fcc_ua, fv_uv, rc;
+	int cur = 0;
 
 	smb2_get_prop_usb_online(chip, &usb_online);
 	if (!usb_online) {
@@ -1600,15 +1630,13 @@ static void smb2_jeita_work(struct work_struct *work)
 	 */
 	rc = power_supply_get_property(batt_psy, POWER_SUPPLY_PROP_CAPACITY,
 				       &val);
+	if (!power_supply_get_property(batt_psy,
+				       POWER_SUPPLY_PROP_CURRENT_NOW, &val))
+		cur = val.intval;
+
 	if (!rc) {
 		int cap = val.intval;
-		int cur = 0;
 		bool full = chip->charge_full;
-
-		if (!power_supply_get_property(batt_psy,
-					       POWER_SUPPLY_PROP_CURRENT_NOW,
-					       &val))
-			cur = val.intval;
 
 		if (cap >= 100 && cur < 400000 && cur > -200000)
 			full = true;
@@ -1620,6 +1648,37 @@ static void smb2_jeita_work(struct work_struct *work)
 			power_supply_changed(chip->chg_psy);
 		}
 	}
+	/*
+	 * "Fake charging" watchdog: the charger is online with charging
+	 * enabled, yet the battery current is negative.  That is the
+	 * post-APSD misconfiguration window (input limit collapsed while
+	 * status says Charging), measured as e.g. -373 mA with the UI
+	 * showing a charging battery.  Instead of waiting for the next
+	 * scheduled APSD rerun (minutes), re-run the classification
+	 * ourselves after two consecutive observations.
+	 */
+	if (cur <= -100000) {
+		if (chip->fake_chg_retries++ >= 1) {
+			chip->fake_chg_retries = 0;
+			power_supply_put(batt_psy);
+			dev_info(chip->dev,
+				 "fake charging detected (batt %d uA): re-applying the ICL\n",
+				 cur);
+			/*
+			 * Re-running APSD does not help - an attached adapter's
+			 * APSD cycle never completes again (measured) - but
+			 * re-programming the limit re-asserts the software
+			 * override and restores the charging current.
+			 */
+			smb2_set_current_limit(chip,
+					       chip->is_smb5 ? 3000000 :
+								DCP_CURRENT_UA);
+			return;
+		}
+	} else {
+		chip->fake_chg_retries = 0;
+	}
+
 	power_supply_put(batt_psy);
 
 	if (temp < SMB2_JEITA_HARD_COLD || temp >= SMB2_JEITA_HARD_HOT) {
@@ -1948,7 +2007,7 @@ static const struct smb2_register smb2_init_seq[] = {
 	   * draining on a 3A charger, 0x54 -> ICL 1.75A and +1.1A into it).
 	   * The mask above clears them on purpose.
 	   */
-	  .val = USBIN_AICL_EN_BIT },
+	  .val = USBIN_AICL_EN_BIT | USBIN_AICL_RERUN_EN_BIT },
 	/*
 	 * Set pre charge current to default, the OnePlus 6 bootloader
 	 * sets this very conservatively.
@@ -2614,6 +2673,137 @@ static ssize_t cp_enable_store(struct device *dev,
 }
 static DEVICE_ATTR_RW(cp_enable);
 
+/*
+ * Diagnostic helpers.  The "fake charging" reports (status=Charging while the
+ * pack discharges) need the PMIC's own view of the input path, not ours: dump
+ * the request bits and let a test override the input current limit live.
+ */
+static ssize_t chg_regs_show(struct device *dev,
+			     struct device_attribute *attr, char *buf)
+{
+	struct smb2_chip *chip = dev_get_drvdata(dev);
+	unsigned int cmd_il = 0, icl_ovr = 0, load_cfg = 0, icl_opt = 0;
+	unsigned int ilim = 0, apsd = 0, apsd_res = 0, chg_en = 0, cfg2 = 0;
+	unsigned int vbus = 0, icl_st = 0, ppath = 0;
+	int rc = 0;
+
+	regmap_read(chip->regmap, chip->base + USBIN_CMD_IL, &cmd_il);
+	regmap_read(chip->regmap, chip->base + CMD_ICL_OVERRIDE, &icl_ovr);
+	regmap_read(chip->regmap, chip->base + USBIN_LOAD_CFG, &load_cfg);
+	regmap_read(chip->regmap, chip->base + USBIN_ICL_OPTIONS, &icl_opt);
+	regmap_read(chip->regmap, chip->base + USBIN_CURRENT_LIMIT_CFG, &ilim);
+	regmap_read(chip->regmap, chip->base + APSD_STATUS, &apsd);
+	regmap_read(chip->regmap, chip->base + APSD_RESULT_STATUS, &apsd_res);
+	regmap_read(chip->regmap, chip->base + CHARGING_ENABLE_CMD, &chg_en);
+	regmap_read(chip->regmap, chip->base + CHGR_CFG2, &cfg2);
+	regmap_read(chip->regmap, chip->base + chip->icl_status_reg, &icl_st);
+	regmap_read(chip->regmap, chip->base + chip->power_path_reg, &ppath);
+	smb2_get_iio_chan(chip, chip->usb_in_v_chan, (int *)&vbus);
+
+	rc = sysfs_emit(buf,
+		"USBIN_CMD_IL=%#04x (suspend=%u)\n"
+		"CMD_ICL_OVERRIDE=%#04x\n"
+		"USBIN_LOAD_CFG=%#04x (apsd_override=%u)\n"
+		"USBIN_ICL_OPTIONS=%#04x (usb51=%u mode_chg=%u)\n"
+		"USBIN_ILIM=%#04x (%u mA)\n"
+		"APSD_STATUS=%#04x APSD_RESULT=%#04x\n"
+		"CHG_EN=%#04x CHGR_CFG2=%#04x (inhibit=%u)\n"
+		"ICL_STATUS=%#04x (%u mA)\n"
+		"POWER_PATH=%#04x (use_usbin=%u suspend_sts=%u valid_src=%u)\n"
+		"VBUS=%u uV\n",
+		cmd_il, !!(cmd_il & USBIN_SUSPEND_BIT),
+		icl_ovr,
+		load_cfg, !!(load_cfg & ICL_OVERRIDE_AFTER_APSD_BIT),
+		icl_opt, !!(icl_opt & USB51_MODE_BIT),
+		!!(icl_opt & USBIN_MODE_CHG_BIT),
+		ilim, ilim * chip->curr_scale / 1000,
+		apsd, apsd_res,
+		chg_en, cfg2, !!(cfg2 & CHARGER_INHIBIT_BIT),
+		icl_st, (icl_st & INPUT_CURRENT_LIMIT_MASK) * chip->curr_scale / 1000,
+		ppath, !!(ppath & P_PATH_USE_USBIN_BIT),
+		!!(ppath & P_PATH_USBIN_SUSPEND_STS_BIT),
+		!!(ppath & P_PATH_VALID_INPUT_POWER_SOURCE_STS_BIT),
+		vbus);
+	return rc;
+}
+static DEVICE_ATTR_RO(chg_regs);
+
+static ssize_t icl_ua_show(struct device *dev,
+			   struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", 0);
+}
+
+static ssize_t icl_ua_store(struct device *dev, struct device_attribute *attr,
+			    const char *buf, size_t count)
+{
+	struct smb2_chip *chip = dev_get_drvdata(dev);
+	unsigned int ua;
+	int rc;
+
+	if (kstrtouint(buf, 0, &ua))
+		return -EINVAL;
+
+	rc = smb2_set_current_limit(chip, ua);
+	if (rc)
+		return rc;
+
+	{
+		unsigned int st = 0;
+
+		msleep(50);	/* the status register lags the request */
+
+		regmap_read(chip->regmap, chip->base + chip->icl_status_reg,
+			    &st);
+		dev_info(chip->dev,
+			 "diagnostic: ICL forced to %u uA, effective %u mA\n",
+			 ua, (st & INPUT_CURRENT_LIMIT_MASK) *
+			     chip->curr_scale / 1000);
+	}
+	return count;
+}
+static DEVICE_ATTR_RW(icl_ua);
+
+static ssize_t aicl_show(struct device *dev, struct device_attribute *attr,
+			 char *buf)
+{
+	struct smb2_chip *chip = dev_get_drvdata(dev);
+	unsigned int v = 0;
+
+	regmap_read(chip->regmap, chip->base + USBIN_AICL_OPTIONS_CFG, &v);
+	return sysfs_emit(buf, "%#04x (en=%u rerun=%u)\n", v,
+			  !!(v & USBIN_AICL_EN_BIT),
+			  !!(v & USBIN_AICL_RERUN_EN_BIT));
+}
+
+static ssize_t aicl_store(struct device *dev, struct device_attribute *attr,
+			  const char *buf, size_t count)
+{
+	struct smb2_chip *chip = dev_get_drvdata(dev);
+	unsigned int en;
+	int rc;
+
+	if (kstrtouint(buf, 0, &en))
+		return -EINVAL;
+
+	/* toggling the enable bit is the only way to restart AICL at will */
+	rc = regmap_update_bits(chip->regmap,
+				chip->base + USBIN_AICL_OPTIONS_CFG,
+				USBIN_AICL_EN_BIT, 0);
+	if (!rc && en)
+		rc = regmap_update_bits(chip->regmap,
+					chip->base + USBIN_AICL_OPTIONS_CFG,
+					USBIN_AICL_EN_BIT |
+					USBIN_AICL_RERUN_EN_BIT,
+					USBIN_AICL_EN_BIT |
+					USBIN_AICL_RERUN_EN_BIT);
+	if (rc)
+		return rc;
+	dev_info(chip->dev, "diagnostic: AICL %s\n", en ? "restarted" : "off");
+	return count;
+}
+static DEVICE_ATTR_RW(aicl);
+
 static int smb2_probe(struct platform_device *pdev)
 {
 	struct power_supply_config supply_config = {};
@@ -2784,6 +2974,12 @@ static int smb2_probe(struct platform_device *pdev)
 			dev_warn(chip->dev, "no typec_role attribute\n");
 		if (device_create_file(chip->dev, &dev_attr_cp_enable))
 			dev_warn(chip->dev, "no cp_enable attribute\n");
+		if (device_create_file(chip->dev, &dev_attr_chg_regs))
+			dev_warn(chip->dev, "no chg_regs attribute\n");
+		if (device_create_file(chip->dev, &dev_attr_icl_ua))
+			dev_warn(chip->dev, "no icl_ua attribute\n");
+		if (device_create_file(chip->dev, &dev_attr_aicl))
+			dev_warn(chip->dev, "no aicl attribute\n");
 		smb2_typec_init(chip);
 		INIT_DELAYED_WORK(&chip->typec_work, smb2_typec_poll);
 		INIT_DELAYED_WORK(&chip->cp_work, smb2_cp_work);
