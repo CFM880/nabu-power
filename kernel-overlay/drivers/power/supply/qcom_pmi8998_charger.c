@@ -29,6 +29,22 @@
 #include <linux/types.h>
 #include <linux/workqueue.h>
 
+/*
+ * nabu: probe the LN8000 charge pump once per plug session.  A plain 5V DCP
+ * adapter cannot answer the QC 9V request; smb2_cp_start() then falls back to
+ * the 5V path, which re-applies the DCP input limit and re-runs APSD, and
+ * cp_failed keeps the probe from being retried until the next plug.  Boot with
+ * cp_auto=0 to keep the pump manual (cp_enable).
+ */
+static bool cp_auto = true;
+module_param(cp_auto, bool, 0644);
+MODULE_PARM_DESC(cp_auto, "Probe the LN8000 charge pump once per plug (default: 1)");
+
+/* Debug: ignore the 90% / temperature gates of the pump probe. */
+static bool cp_force;
+module_param(cp_force, bool, 0644);
+MODULE_PARM_DESC(cp_force, "Ignore the pump capacity/temperature gates (debug)");
+
 /* clang-format off */
 #define BATTERY_CHARGER_STATUS_1			0x06
 #define BVR_INITIAL_RAMP_BIT				BIT(7)
@@ -554,6 +570,8 @@ struct smb2_chip {
 	bool cp_requested;
 	bool cp_auto;		/* start on a QC adapter without being asked */
 	bool cp_failed;		/* this plug session already failed once */
+	bool cp_gate_logged;	/* told the user the pump is waiting */
+	int cp_retries;		/* pump/battery supply not up yet */
 	int cp_taper;
 	unsigned int cp_ibat_ua;
 	/* consecutive polls that wanted host, to filter dual-role transients */
@@ -1425,9 +1443,11 @@ static void smb2_status_change_work(struct work_struct *work)
 
 	smb2_get_prop_usb_online(chip, &usb_online);
 	if (!usb_online) {
-		chip->cp_failed = false;	/* fresh plug may work */
 		if (chip->cp_active)
 			smb2_cp_stop(chip, "unplugged");
+		chip->cp_failed = false;	/* fresh plug may work */
+		chip->cp_gate_logged = false;
+		chip->cp_retries = 0;
 		/* The adapter may already be attached at boot before the power
 		 * path settles; keep retrying instead of relying on a plug
 		 * interrupt that never comes for a boot-time cable. */
@@ -2428,6 +2448,12 @@ static void smb2_cp_stop(struct smb2_chip *chip, const char *why)
 	chip->cp_active = false;
 	chip->cp_requested = false;
 	chip->cp_taper = 0;
+	/*
+	 * The automatic probe is once per plug session: after a taper or a
+	 * monitor stop, do not walk back into it from the re-classification
+	 * that smb2_cp_restore_5v() schedules.  The unplug path resets this.
+	 */
+	chip->cp_failed = true;
 	power_supply_changed(chip->chg_psy);
 
 	/* hand the battery back to the buck */
@@ -2450,13 +2476,15 @@ static int smb2_cp_start(struct smb2_chip *chip)
 	}
 
 	/* Safety gates: never start the pump outside this window. */
-	if (!smb2_batt_get(chip, POWER_SUPPLY_PROP_TEMP, &temp) &&
+	if (!cp_force &&
+	    !smb2_batt_get(chip, POWER_SUPPLY_PROP_TEMP, &temp) &&
 	    (temp < SMB2_CP_TEMP_MIN || temp > SMB2_CP_TEMP_MAX)) {
 		dev_info(chip->dev, "cp: battery %d (0.1C) outside the window\n",
 			 temp);
 		return -ERANGE;
 	}
-	if (!smb2_batt_get(chip, POWER_SUPPLY_PROP_CAPACITY, &cap) &&
+	if (!cp_force &&
+	    !smb2_batt_get(chip, POWER_SUPPLY_PROP_CAPACITY, &cap) &&
 	    cap >= 90) {
 		dev_info(chip->dev, "cp: battery at %d%%, not worth it\n", cap);
 		return -ERANGE;
@@ -2583,8 +2611,68 @@ static void smb2_cp_work(struct work_struct *work)
 	int online = 0, ibat = 0, temp = 0, cap = 0, rc;
 
 	if (!chip->cp_active) {
-		if (chip->cp_auto && !chip->cp_failed &&
-		    smb2_cp_start(chip))
+		int type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
+
+		if (!chip->cp_auto || chip->cp_failed)
+			return;
+
+		/*
+		 * The LN8000 driver is a module and the battery supply comes up
+		 * at its own pace, so at boot this work runs before either is
+		 * ready.  Wait for them instead of spending the attempt.
+		 */
+		if (smb2_cp_psy_get(chip) ||
+		    smb2_batt_get(chip, POWER_SUPPLY_PROP_CAPACITY, &cap)) {
+			if (++chip->cp_retries > 30)
+				chip->cp_failed = true;	/* no pump, stay at 5V */
+			else
+				schedule_delayed_work(&chip->cp_work,
+						      msecs_to_jiffies(5000));
+			return;
+		}
+		chip->cp_retries = 0;
+
+		/*
+		 * Only a DCP adapter can answer the QC 9V request; SDP and CDP
+		 * are data ports and must not be disturbed.  If APSD has not
+		 * finished, leave cp_failed alone so a later classification
+		 * can schedule this work again.
+		 */
+		if (smb2_apsd_get_charger_type(chip, &type) ||
+		    type != POWER_SUPPLY_USB_TYPE_DCP)
+			return;
+
+		/*
+		 * The pump only pays off below 90% and inside the temperature
+		 * window.  Outside it, keep the 5V path and look again later
+		 * instead of spending the one attempt per plug: the battery
+		 * may drop below 90% while the adapter stays connected.
+		 */
+		if (smb2_batt_get(chip, POWER_SUPPLY_PROP_TEMP, &temp))
+			temp = 0;
+		if (!cp_force &&
+		    (cap >= 90 ||
+		     temp < SMB2_CP_TEMP_MIN || temp > SMB2_CP_TEMP_MAX)) {
+			if (!chip->cp_gate_logged) {
+				dev_info(chip->dev,
+					 "cp: waiting (battery %d%%, %d.%d C)\n",
+					 cap, temp / 10, abs(temp % 10));
+				chip->cp_gate_logged = true;
+			}
+			schedule_delayed_work(&chip->cp_work,
+					      msecs_to_jiffies(5 * 60 * 1000));
+			return;
+		}
+
+		chip->cp_gate_logged = false;
+		rc = smb2_cp_start(chip);
+		if (rc == -ERANGE) {
+			/* a gate changed under us; look again later */
+			schedule_delayed_work(&chip->cp_work,
+					      msecs_to_jiffies(5 * 60 * 1000));
+			return;
+		}
+		if (rc)
 			chip->cp_failed = true;	/* once per plug session */
 		return;
 	}
@@ -2994,14 +3082,13 @@ static int smb2_probe(struct platform_device *pdev)
 		INIT_DELAYED_WORK(&chip->typec_work, smb2_typec_poll);
 		INIT_DELAYED_WORK(&chip->cp_work, smb2_cp_work);
 		/*
-		 * Do not start the LN8000 charge pump on our own.  On a plain
-		 * DCP 5V adapter the pump cannot bring VBUS up to 9V, and each
-		 * failed attempt re-runs APSD; the loop leaves the input limit
-		 * collapsed to 100mA and the tablet discharges while "charging"
-		 * (measured).  The pump stays available through the cp_enable
-		 * attribute for adapters that can do 9V.
+		 * Try the pump once per plug session (see cp_auto).  A plain
+		 * DCP 5V adapter cannot bring VBUS up to 9V; the failed attempt
+		 * falls back to the 5V path through smb2_cp_restore_5v(), which
+		 * re-applies the DCP limit and re-runs APSD, and cp_failed stops
+		 * it from looping.  cp_enable still forces it by hand.
 		 */
-		chip->cp_auto = false;
+		chip->cp_auto = cp_auto;
 		/* Automatic role detection is a 2 s poll.  The old "no polling"
 		 * default existed only because the Type-C registers were read at
 		 * the wrong address; with that fixed the poll is what makes the
@@ -3130,7 +3217,13 @@ static int smb2_resume(struct device *dev)
 	if (device_may_wakeup(dev))
 		disable_irq_wake(chip->cable_irq);
 
-	chip->cp_failed = false;
+	/*
+	 * Re-run the detection, but do not turn every resume into another
+	 * 9V probe on a plain 5V adapter: only a pump that was running is
+	 * allowed to restart.  A fresh plug clears the latch.
+	 */
+	if (chip->cp_active)
+		chip->cp_failed = false;
 	schedule_delayed_work(&chip->status_change_work,
 			      msecs_to_jiffies(200));
 
