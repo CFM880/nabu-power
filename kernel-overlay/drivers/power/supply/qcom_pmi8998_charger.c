@@ -2708,12 +2708,12 @@ static void smb2_cp_work(struct work_struct *work)
 	if (!smb2_batt_get(chip, POWER_SUPPLY_PROP_TEMP, &temp) &&
 	    (temp < SMB2_CP_TEMP_MIN || temp > SMB2_CP_TEMP_MAX)) {
 		smb2_cp_stop(chip, "battery temperature");
-		return;
+		goto retry_later;
 	}
 	if (!smb2_batt_get(chip, POWER_SUPPLY_PROP_CAPACITY, &cap) &&
 	    cap >= 92) {
 		smb2_cp_stop(chip, "battery full enough");
-		return;
+		goto retry_later;
 	}
 
 	/* Taper: the pump is delivering less than the battery wants - done. */
@@ -2728,6 +2728,17 @@ static void smb2_cp_work(struct work_struct *work)
 
 	schedule_delayed_work(&chip->cp_work,
 			      msecs_to_jiffies(SMB2_CP_POLL_MS));
+	return;
+
+retry_later:
+	/*
+	 * A full battery or a hot pack is not a failure: the 5V path keeps
+	 * charging and the probe comes back once the battery drops below 90%
+	 * or the temperature returns, even without a replug.
+	 */
+	chip->cp_failed = false;
+	schedule_delayed_work(&chip->cp_work,
+			      msecs_to_jiffies(5 * 60 * 1000));
 }
 
 static ssize_t cp_enable_show(struct device *dev,
