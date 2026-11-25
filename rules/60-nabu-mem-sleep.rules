@@ -1,10 +1,8 @@
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# Platform "mem" (deep) suspend cannot be woken by the power key while a
-# charger is attached: the PMIC latches the PON interrupt but the SPMI
-# summary/PDC path does not fire for it (see KNOWN-ISSUES.md 2.5.6), so the
-# tablet would stay asleep until the charger is unplugged.  s2idle is reliable
-# on AC and AC has no standby budget to save; deep sleep on battery keeps the
-# ~1 %/h drain and wakes from the key.  Pick the mode from the charger state.
+# Deep suspend is not reliable on this board: the power key sometimes cannot
+# wake it and the machine can stay dead until the 15 s reset (see
+# KNOWN-ISSUES.md 2.5.6).  Keep the system on s2idle; the kernel command line
+# already defaults to it and this rule re-applies it after power events.
 SUBSYSTEM=="power_supply", ENV{POWER_SUPPLY_TYPE}=="USB", ENV{POWER_SUPPLY_ONLINE}=="1", RUN+="/usr/local/libexec/nabu-mem-sleep"
 SUBSYSTEM=="power_supply", ENV{POWER_SUPPLY_TYPE}=="USB", ENV{POWER_SUPPLY_ONLINE}=="0", RUN+="/usr/local/libexec/nabu-mem-sleep"

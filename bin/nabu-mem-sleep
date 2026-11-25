@@ -1,36 +1,25 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# nabu-mem-sleep - pick the system sleep mode from the charger state.
+# nabu-mem-sleep - keep the system on s2idle.
 #
-# In platform "mem" (deep) suspend the SoC enters AOSS, and on this board a
-# press of the power key does not take it out of that state while a charger is
-# attached: the PMIC latches the PON interrupt and PON_INT_EN is set (verified
-# with the SDAM black box), but the SPMI summary -> PDC pin 1 path is not
-# asserted for it, while the charger IRQ on the same line does wake the SoC.
-# s2idle keeps the CPU available for the key interrupt, and AC has no standby
-# power budget to save, so use it there.  On battery deep sleep is the one that
-# sleeps at ~1 %/h and the key wakes it (5/5 verified).
+# Platform "mem" (deep) suspend is not reliable on this board: the power key
+# fails to wake it now and then (the PMIC latches the PON interrupt and
+# PON_INT_EN is set - verified with the SDAM black box - but the SPMI summary
+# -> PDC path does not always take the SoC out of AOSS), and in the worst case
+# the machine stays dead until the 15 s power-button reset.  s2idle keeps the
+# CPU available for the key interrupt and has been reliable on both AC and
+# battery, so use it by default.  The cost is the standby drain (~1.5 %/h on
+# s2idle versus ~0.1 %/h on deep); `echo deep > /sys/power/mem_sleep` still
+# switches the current boot to deep for anyone who accepts that risk.
 #
 # Called from 60-nabu-mem-sleep.rules on the USB power supply's online
-# transitions.  Details: nabu-linux-overlay/docs/KNOWN-ISSUES.md 2.5.6.
+# transitions, and the kernel command line already carries
+# mem_sleep_default=s2idle.  Details: docs/KNOWN-ISSUES.md 2.5.6.
 
 set -u
 
-online=0
-for ps in /sys/class/power_supply/*; do
-	[ -r "$ps/type" ] || continue
-	[ "$(cat "$ps/type" 2>/dev/null)" = "USB" ] || continue
-	if [ "$(cat "$ps/online" 2>/dev/null)" = "1" ]; then
-		online=1
-	fi
-done
-
-if [ "$online" = 1 ]; then
-	mode=s2idle
-else
-	mode=deep
-fi
+mode=s2idle
 
 [ -w /sys/power/mem_sleep ] || exit 0
 
