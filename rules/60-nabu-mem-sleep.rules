@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# Deep suspend is not reliable on this board: the power key sometimes cannot
-# wake it and the machine can stay dead until the 15 s reset (see
-# KNOWN-ISSUES.md 2.5.6).  Keep the system on s2idle; the kernel command line
-# already defaults to it and this rule re-applies it after power events.
+# Deep sleep is what keeps the standby drain low, but the power key does not
+# always wake it (see KNOWN-ISSUES.md 2.5.6).  On AC that does not matter, so
+# use s2idle while a charger is attached and deep on battery.
 SUBSYSTEM=="power_supply", ENV{POWER_SUPPLY_TYPE}=="USB", ENV{POWER_SUPPLY_ONLINE}=="1", RUN+="/usr/local/libexec/nabu-mem-sleep"
 SUBSYSTEM=="power_supply", ENV{POWER_SUPPLY_TYPE}=="USB", ENV{POWER_SUPPLY_ONLINE}=="0", RUN+="/usr/local/libexec/nabu-mem-sleep"

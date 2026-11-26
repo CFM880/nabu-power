@@ -1,25 +1,35 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# nabu-mem-sleep - keep the system on s2idle.
+# nabu-mem-sleep - pick the sleep mode from the charger state.
 #
-# Platform "mem" (deep) suspend is not reliable on this board: the power key
-# fails to wake it now and then (the PMIC latches the PON interrupt and
-# PON_INT_EN is set - verified with the SDAM black box - but the SPMI summary
-# -> PDC path does not always take the SoC out of AOSS), and in the worst case
-# the machine stays dead until the 15 s power-button reset.  s2idle keeps the
-# CPU available for the key interrupt and has been reliable on both AC and
-# battery, so use it by default.  The cost is the standby drain (~1.5 %/h on
-# s2idle versus ~0.1 %/h on deep); `echo deep > /sys/power/mem_sleep` still
-# switches the current boot to deep for anyone who accepts that risk.
+# Deep sleep is what keeps the standby drain at ~0.1 %/h, but the power key
+# does not always wake it (the PMIC latches the PON interrupt and PON_INT_EN
+# is set - verified with the SDAM black box - yet the SPMI summary/PDC path
+# does not always take the SoC out of AOSS; one round needed the 15 s reset).
+# While a charger is attached that does not matter - s2idle is reliably woken
+# by the key and AC has no standby budget to save - so use s2idle on AC and
+# deep on battery.
 #
 # Called from 60-nabu-mem-sleep.rules on the USB power supply's online
-# transitions, and the kernel command line already carries
-# mem_sleep_default=s2idle.  Details: docs/KNOWN-ISSUES.md 2.5.6.
+# transitions.  Details: docs/KNOWN-ISSUES.md 2.5.6.
 
 set -u
 
-mode=s2idle
+online=0
+for ps in /sys/class/power_supply/*; do
+	[ -r "$ps/type" ] || continue
+	[ "$(cat "$ps/type" 2>/dev/null)" = "USB" ] || continue
+	if [ "$(cat "$ps/online" 2>/dev/null)" = "1" ]; then
+		online=1
+	fi
+done
+
+if [ "$online" = 1 ]; then
+	mode=s2idle
+else
+	mode=deep
+fi
 
 [ -w /sys/power/mem_sleep ] || exit 0
 
